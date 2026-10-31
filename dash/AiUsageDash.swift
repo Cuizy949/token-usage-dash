@@ -119,13 +119,15 @@ final class DataFetcher {
 
     // 解析器与采集脚本：默认相对本二进制定位（仓库布局 dash/../collectors），
     // 可用环境变量覆盖（AIUSD_PYTHON / AIUSD_FETCH_SCRIPT）
-    private var venvPython: String {
+    var venvPython: String {
         let env = ProcessInfo.processInfo.environment
         return env["AIUSD_PYTHON"] ?? "/usr/bin/env"
     }
-    private var usesEnvShim: Bool {
+    var usesEnvShim: Bool {
         ProcessInfo.processInfo.environment["AIUSD_PYTHON"] == nil
     }
+    // ReportRunner 复用同一解释器解析
+    var pythonPath: String { venvPython }
     private var fetchScript: String {
         let env = ProcessInfo.processInfo.environment
         if let p = env["AIUSD_FETCH_SCRIPT"] { return p }
@@ -1015,6 +1017,21 @@ final class DashMenuController: NSObject, NSMenuDelegate {
         }
         let transparencyTitle = NSMenuItem(title: "玻璃透明度", action: nil, keyEquivalent: "")
         transparencyTitle.submenu = transparencyMenu
+        // 统计报表子菜单：本地 store（ausd_store）的日报/汇总/区间/排行 + store 更新。
+        // 放在 freqTitle 之后、separator 之前（index 8，遵守上方硬编码索引警告）。
+        let reportMenu = NSMenu()
+        reportMenu.delegate = c
+        for (title, action) in [("昨日日报", #selector(DashMenuController.reportDaily)),
+                                ("本月汇总", #selector(DashMenuController.reportMonth)),
+                                ("近 7 天汇总", #selector(DashMenuController.reportWeek)),
+                                ("模型 token 排行", #selector(DashMenuController.reportRank)),
+                                ("更新统计 store（昨日）", #selector(DashMenuController.reportStoreUpdate))] {
+            let mi = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            mi.target = c
+            reportMenu.addItem(mi)
+        }
+        let reportTitle = NSMenuItem(title: "统计报表", action: nil, keyEquivalent: "")
+        reportTitle.submenu = reportMenu
         // 局部变量名避开方法名 quit（#selector(quit) 会被局部变量遮蔽报错）
         let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = c
@@ -1026,6 +1043,7 @@ final class DashMenuController: NSObject, NSMenuDelegate {
         menu.addItem(locked)
         menu.addItem(cardsTitle)
         menu.addItem(freqTitle)
+        menu.addItem(reportTitle)         // 统计报表（index 8）
         menu.addItem(.separator())
         menu.addItem(quitItem)
         return menu
@@ -1102,6 +1120,133 @@ final class DashMenuController: NSObject, NSMenuDelegate {
         AiUsageDashApp.toggleCardVisibility(key)
     }
     @objc func quit() { NSApp.terminate(nil) }
+
+    // ---- 统计报表（本地 store / 日报脚本，后台执行，文本窗口呈现）----
+    @objc func reportDaily() {
+        ReportRunner.run(title: "昨日日报",
+                         script: "ai_usage_summary.py",
+                         args: ["--date", ReportRunner.dateStr(daysAgo: 1)])
+    }
+    @objc func reportMonth() {
+        let month = DateFormatter()
+        month.dateFormat = "yyyy-MM"
+        ReportRunner.run(title: "本月汇总（store 封闭日）",
+                         script: "ausd_store.py",
+                         args: ["query", "--month", month.string(from: Date())])
+    }
+    @objc func reportWeek() {
+        ReportRunner.run(title: "近 7 天汇总（store 封闭日）",
+                         script: "ausd_store.py",
+                         args: ["query", "--from", ReportRunner.dateStr(daysAgo: 7),
+                                "--to", ReportRunner.dateStr(daysAgo: 0)])
+    }
+    @objc func reportRank() {
+        ReportRunner.run(title: "模型 token 排行（store）",
+                         script: "ausd_store.py", args: ["rank"])
+    }
+    @objc func reportStoreUpdate() {
+        ReportRunner.run(title: "更新统计 store（昨日）",
+                         script: "ausd_store.py", args: ["update"])
+    }
+}
+
+// MARK: - 统计报表窗口与执行器
+
+/// 全局唯一文本报表窗口：monospace 只读，复用不重建（避免多窗口堆积）
+final class ReportWindowController {
+    static let shared = ReportWindowController()
+    private var window: NSWindow?
+    private var textView: NSTextView?
+
+    func show(title: String, text: String) {
+        if window == nil {
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                               backing: .buffered, defer: false)
+            win.title = title
+            win.isReleasedWhenClosed = false
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 760, height: 560))
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            scroll.borderType = .noBorder
+            let tv = NSTextView(frame: scroll.bounds)
+            tv.isEditable = false
+            tv.isRichText = false
+            tv.autoresizingMask = [.width]
+            tv.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            tv.textContainerInset = NSSize(width: 12, height: 12)
+            scroll.documentView = tv
+            win.contentView = scroll
+            window = win
+            textView = tv
+        }
+        window?.title = title
+        textView?.string = text
+        textView?.scroll(.zero)   // 回到顶部
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// 报表命令执行：与 DataFetcher 同一套解释器解析与仓库相对脚本定位
+final class ReportRunner {
+    static func scriptPath(_ name: String) -> String {
+        if let p = ProcessInfo.processInfo.environment["AIUSD_COLLECTORS_DIR"] {
+            return p + "/" + name
+        }
+        let execDir = Bundle.main.executableURL?.deletingLastPathComponent().path ?? ""
+        return execDir + "/../collectors/" + name
+    }
+
+    static func dateStr(daysAgo: Int) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"   // yyyy=日历年；YYYY 是周年历，年末会错位
+        return f.string(from: Date().addingTimeInterval(TimeInterval(-daysAgo) * 86400))
+    }
+
+    static func run(title: String, script: String, args: [String]) {
+        let runner = DataFetcher.shared
+        let scriptPath = scriptPath(script)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: runner.pythonPath)
+            proc.arguments = runner.usesEnvShim
+                ? ["python3", scriptPath] + args
+                : [scriptPath] + args
+            let outPipe = Pipe(), errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+            var timedOut = false
+            let timeoutWork = DispatchWorkItem { [weak proc] in
+                timedOut = true
+                proc?.terminate()
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 300, execute: timeoutWork)
+            var output: String
+            do {
+                try proc.run()
+                let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                output = String(data: data, encoding: .utf8) ?? ""
+                if timedOut {
+                    output += "\n⚠ 超时终止（300s）"
+                } else if proc.terminationStatus != 0 {
+                    let err = String(data: errData, encoding: .utf8) ?? ""
+                    output += "\n⚠ 退出码 \(proc.terminationStatus)" + (err.isEmpty ? "" : "\n" + err)
+                }
+            } catch {
+                output = "⚠ 启动失败: \(error.localizedDescription)\n脚本: \(scriptPath)"
+            }
+            timeoutWork.cancel()
+            let header = "执行: python3 \(scriptPath) \(args.joined(separator: " "))\n"
+                         + String(repeating: "─", count: 46) + "\n\n"
+            DispatchQueue.main.async {
+                ReportWindowController.shared.show(title: title, text: header + output)
+            }
+        }
+    }
 }
 
 extension Array {
