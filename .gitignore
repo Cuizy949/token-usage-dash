@@ -15,3 +15,7 @@ config.local.*
 # 图表/截图产物
 *.png.html
 tmp/
+
+# 本地工具缓存
+.video_agent/
+.zcode/

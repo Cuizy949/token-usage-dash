@@ -7,8 +7,9 @@
 高峰结论，绝不硬凑）。
 
 数据源与计数规则（与各底层脚本同口径，防止漂移）：
-- Codex rollout: ~/.codex/sessions/ + archived_sessions/，token_count 事件的
-  last_token_usage.total_tokens（扫描循环镜像 codex_usage.py）；
+- Codex rollout: ~/.codex/sessions/ + archived_sessions/（含 .jsonl.zst），
+  token_count 事件的 last_token_usage.total_tokens（文件读取复用
+  codex_usage.read_rollout，扫描循环镜像 codex_usage.py）；
 - Codex ephemeral exec: 复用共享实现 codex_audit_scanner.py（单一实现防漂移）；
 - Claude Code: ~/.claude/projects/*.jsonl，assistant 消息按 message.id 去重
   （镜像 cc_usage.py）；
@@ -20,9 +21,7 @@
 - ZCode: model_usage 表 completed 行，started_at epoch ms 按本地时区分桶
   （同 zcode_usage.py 归日本地日口径）；
 - WorkBuddy: 复用 workbuddy_usage._iter_raw_usage()（messageId 去重 + _num
-  守卫在调用方保持一致）；
-- mini 端（Hermes/ZCode mini）只有日级汇总，无小时数据，天然缺席——
-  由 coverage 比对吸收，不影响高峰结论的定性。
+  守卫在调用方保持一致）。
 
 Stdlib only, read-only.
 """
@@ -37,15 +36,10 @@ from datetime import datetime, timedelta, timezone
 
 LOCAL_TZ = datetime.now(timezone.utc).astimezone().tzinfo
 HERE = os.path.dirname(os.path.abspath(__file__))
-CATEGORY_DIR = os.path.expanduser(
-    "~/.hermes/skills/autonomous-ai-agents")
 
 def _find_sibling(name: str) -> str:
-    """采集脚本定位：优先仓库扁平布局（与本脚本同目录），回退 Hermes skill 目录布局。"""
-    p = os.path.join(HERE, name)
-    if os.path.exists(p):
-        return p
-    return os.path.join(CATEGORY_DIR, name)
+    """采集脚本定位：仓库扁平布局（与本脚本同目录）。"""
+    return os.path.join(HERE, name)
 
 TRAPE_DB = os.path.expanduser(
     "~/Library/Application Support/Trae CN/User/globalStorage/"
@@ -85,7 +79,8 @@ def _new_buckets():
 
 def codex_hourly(date_str: str) -> dict:
     """镜像 codex_usage.py 的扫描规则（cutoff/截断/窗口/total 口径），按小时
-    累计 token_count.last_token_usage.total_tokens；ephemeral exec 走共享
+    累计 token_count.last_token_usage.total_tokens；文件读取复用
+    codex_usage.read_rollout（含 .jsonl.zst 归档）；ephemeral exec 走共享
     codex_audit_scanner（单一实现）。"""
     win_start, win_end = _window(date_str)
     ws_utc = win_start.astimezone(timezone.utc)
@@ -93,42 +88,47 @@ def codex_hourly(date_str: str) -> dict:
     buckets = _new_buckets()
 
     _cutoff = win_start.timestamp() - 86400
+    # glob 模式与 codex_usage.collect_window 一致（含 .zst 归档，防漏扫）
     files = sorted(
-        (f for f in
-         glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"))
-         + glob.glob(os.path.expanduser("~/.codex/archived_sessions/rollout-*.jsonl"))
+        (f for pat in (
+            "~/.codex/sessions/*/*/*/rollout-*.jsonl",
+            "~/.codex/sessions/*/*/*/rollout-*.jsonl.zst",
+            "~/.codex/archived_sessions/rollout-*.jsonl",
+            "~/.codex/archived_sessions/rollout-*.jsonl.zst",
+        ) for f in glob.glob(os.path.expanduser(pat))
          if os.path.getmtime(f) >= _cutoff),
         key=os.path.getmtime, reverse=True,
     )[:2000]
 
+    read_rollout = _load_module(
+        "codex_usage", _find_sibling("codex_usage.py")).read_rollout
     for fp in files:
         if os.path.getmtime(fp) < _cutoff:
             continue
-        try:
-            with open(fp, errors="ignore") as fh:
-                for line in fh:
-                    if '"token_count"' not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    p = d.get("payload") or {}
-                    if p.get("type") != "token_count":
-                        continue
-                    ts_raw = d.get("timestamp", "")
-                    try:
-                        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-                    if ts < ws_utc or ts >= we_utc:
-                        continue
-                    last = ((p.get("info") or {}).get("last_token_usage") or {})
-                    v = last.get("total_tokens") or 0
-                    if v:
-                        buckets[ts.astimezone(LOCAL_TZ).hour] += v
-        except OSError:
-            continue
+        lines = read_rollout(fp)
+        if lines is None:
+            continue   # 读取/解压失败跳过（zstd 缺失等，不静默漏算由 CLI 层告警）
+        for line in lines:
+            if '"token_count"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            p = d.get("payload") or {}
+            if p.get("type") != "token_count":
+                continue
+            ts_raw = d.get("timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if ts < ws_utc or ts >= we_utc:
+                continue
+            last = ((p.get("info") or {}).get("last_token_usage") or {})
+            v = last.get("total_tokens") or 0
+            if v:
+                buckets[ts.astimezone(LOCAL_TZ).hour] += v
 
     # ephemeral exec 批量任务：共享 scanner（ts 已是本地时区）
     scanner = _load_module("codex_audit_scanner", _find_sibling("codex_audit_scanner.py"))
@@ -199,9 +199,7 @@ def cc_hourly(date_str: str) -> dict:
 
 def hermes_hourly(date_str: str) -> dict:
     """复用 hermes_usage.iter_calls()（LINE_RE 单一实现），实时解析 agent.log*。"""
-    mod = _load_module(
-        "hermes_usage_ref", os.path.join(
-            CATEGORY_DIR, "hermes-usage-stats", "scripts", "hermes_usage.py"))
+    mod = _load_module("hermes_usage_ref", _find_sibling("hermes_usage.py"))
     log_files, _ = mod.default_paths()
     target = datetime.strptime(date_str, "%Y-%m-%d").date()
     buckets = _new_buckets()
@@ -216,11 +214,9 @@ def hermes_hourly(date_str: str) -> dict:
 
 def _load_trae34_engine():
     """定位并加载 trae_usage_34x（3.4.x 解密引擎）；找不到返回 None。"""
-    for pat in (os.path.join(CATEGORY_DIR,
-                             "trae-usage-stats/scripts/trae_usage_34x.py"),):
-        hits = sorted(glob.glob(pat))
-        if hits:
-            return _load_module("trae_usage_34x", hits[0])
+    path = _find_sibling("trae_usage_34x.py")
+    if os.path.exists(path):
+        return _load_module("trae_usage_34x", path)
     return None
 
 
@@ -331,9 +327,7 @@ def zcode_hourly(date_str: str) -> dict:
 
 def workbuddy_hourly(date_str: str) -> dict:
     """复用 workbuddy_usage._iter_raw_usage()；去重/数值守卫与 day_model_totals 一致。"""
-    mod = _load_module(
-        "workbuddy_usage_ref", os.path.join(
-            CATEGORY_DIR, "workbuddy-usage", "scripts", "workbuddy_usage.py"))
+    mod = _load_module("workbuddy_usage_ref", _find_sibling("workbuddy_usage.py"))
     buckets = _new_buckets()
     seen = set()
     for ts, _model, ru, dedup in mod._iter_raw_usage(day_date=date_str):

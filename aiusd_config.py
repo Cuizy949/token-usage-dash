@@ -15,6 +15,11 @@
   AIUSD_STATE_DIR    状态文件目录（默认 ~/.cache/ai_usage_dash）：
                      键盘推送状态、WorkBuddy 日台账、Trae 解密缓存、锁文件。
   AIUSD_PYTHON       子进程采集用的解释器（默认沿用当前解释器 sys.executable）。
+  AIUSD_CODEX_BIN    Codex CLI 可执行路径（额度探针 app-server 用）。
+                     默认 PATH 上的 codex，再回退 ~/.local/bin/codex。
+  AIUSD_CODEX_AUDIT_ROOTS  ephemeral codex exec 批量任务的 audit_logs glob 根
+                     （冒号分隔，如 "~/Work/A/*/outputs/audit_logs/*:~/Work/B/*"）。
+                     未设置 → 不扫该源（ephemeral exec 用量不计入）。
   HERMES_HOME        Hermes 数据目录（hermes_usage.py / ai_usage_summary.py 原生支持，
                      默认 ~/.hermes；用于读取 agent.log 用量流水与 usage store）。
 
@@ -28,7 +33,6 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 COLLECTORS_DIR = os.path.join(REPO_ROOT, "collectors")
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets", "icons")
-CONFIG_DIR = os.path.join(REPO_ROOT, "config")
 
 STATE_DIR = os.environ.get("AIUSD_STATE_DIR") or os.path.expanduser(
     "~/.cache/ai_usage_dash")

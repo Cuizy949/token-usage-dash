@@ -214,7 +214,6 @@ def collect_workbuddy():
         out.update({
             'turns': f'{calls} 次',
             'tokens': fmt_tokens(tokens),
-            'tokens_raw': tokens,   # 冗余字段：keydash 已不并入合计（summary N工具合计含 WB，二次合并=双计）
             'model': model,
         })
     except Exception:

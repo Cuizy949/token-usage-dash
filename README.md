@@ -6,7 +6,8 @@ local-first, offline, zero cloud. Native-macOS-widget look.
 macOS 桌面悬浮 AI Token 用量仪表盘：单文件 Swift（NSPanel 无边框置顶，支持
 macOS 26 液态玻璃）+ Python 采集层，统计 Codex / Claude Code / Hermes Agent /
 Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成与额度余量，
-可选推送渲染图到局域网小屏设备、发送飞书日报卡片。
+可选推送渲染图到局域网小屏设备、经日报 CLI 输出 stdout 报告（文本/JSON，
+供 agent 调用）。离线单机：不接任何 gateway/IM，零云依赖。
 
 ```
 ┌─ dash/AiUsageDash.swift ── 悬浮卡 UI（经典/玻璃双模式、菜单、事件驱动刷新）
@@ -25,8 +26,7 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 │   ├─ model_usage_rank.py  · 模型维度总排行（静态基线 + 归档增量，O(1)）
 │   └─ make_usage_trend_chart.py · 月度趋势图（Chrome headless 出 PNG）
 ├─ report/                  ── 交付出口
-│   ├─ daily_usage_card.py  · 飞书交互式日报卡片（凭据全部走环境变量）
-│   ├─ merge_mini_usage.py  · 多机归档幂等合并（先减后加账本，重跑安全）
+│   ├─ daily_report.py      · 日报 CLI（stdout 文本/JSON 供 agent 调用；可选 NAS 月归档）
 │   └─ usage_store_reconcile.sh · usage store 与日志真值月度对账（防双计）
 ├─ assets/icons/            ── 工具图标（各商标归各自所有者）
 └─ launchd/                 ── launchd plist 模板（常驻悬浮卡）
@@ -35,12 +35,13 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 ## 环境要求
 
 - macOS 14+（液态玻璃模式需 macOS 26+ SDK 编译、26+ 运行）
-- Python 3.10+（标准库即可运行采集层；飞书卡片另需 `lark_oapi` + `pyyaml`）
+- Python 3.10+（核心采集层标准库即可，可选依赖见下）
 - Xcode CommandLineTools（`xcrun swiftc`）
 - 各 AI 工具已在本机使用过（数据源均为各工具本地日志/数据库的**只读**访问）：
   `~/.codex`、`~/.claude`、`~/.workbuddy`、`~/.zcode`、Trae Application Support、
   Hermes `~/.hermes/logs`（可经 `HERMES_HOME` 重定向）
-- 可选：`zstd`（Codex `.jsonl.zst` 归档会话解压）、Google Chrome（趋势图渲染）
+- 可选：`Pillow`（小屏卡片渲染）、`pycryptodome`（Trae 3.4.x 加密库解密）、
+  `zstd`（Codex `.jsonl.zst` 归档会话解压）、Google Chrome（趋势图 PNG 渲染）
 
 ## 构建与运行
 
@@ -86,13 +87,14 @@ collect_window` 等），store 日合计与采集器文本出口逐 token 一致
 | 变量 | 作用 | 缺省行为 |
 |---|---|---|
 | `AIUSD_PYTHON` | 子进程采集解释器 | 沿用当前 `python3` |
+| `AIUSD_CODEX_BIN` | Codex CLI 路径（额度探针 app-server 用） | PATH 上的 `codex`，回退 `~/.local/bin/codex` |
+| `AIUSD_CODEX_AUDIT_ROOTS` | ephemeral `codex exec` 批量任务 audit_logs glob 根（冒号分隔） | 不扫该源 |
 | `AIUSD_DEVICE_HOST` | 小屏设备 IP，渲染图 POST 到 `http://<host>/image/upload` | 不推送，仅存图 |
 | `AIUSD_NAS_VOLUME` | NAS 挂载点（月度用量归档 JSON 所在卷） | 归档读写跳过 |
 | `AIUSD_NAS_MOUNT_URL` | NAS WebDAV URL，卷掉线时 osascript 自动重挂 | 不自动重挂 |
 | `AIUSD_STATE_DIR` | 状态目录（台账/锁/推送状态/Trae 解密缓存） | `~/.cache/ai_usage_dash` |
-| `AIUSD_PREARCHIVE_BASELINE` | 排行榜静态基线 JSON（含个人历史数据，自行生成） | 回退 `~/.hermes/scripts/` |
+| `AIUSD_PREARCHIVE_BASELINE` | 排行榜静态基线 JSON（含个人历史数据，自行生成） | 排行走全量扫描 |
 | `HERMES_HOME` | Hermes 数据目录 | `~/.hermes` |
-| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书应用凭据（日报卡片） | 不启用卡片发送 |
 
 本仓库不含任何凭据与个人数据；全部个人环境项走环境变量（集中定义见
 `aiusd_config.py`）。
@@ -103,8 +105,11 @@ collect_window` 等），store 日合计与采集器文本出口逐 token 一致
 # 每 15 分钟推送小屏（完全静默：失败不告警，设备离线时仅毫秒级 TCP 预检）
 AIUSD_DEVICE_HOST=192.168.x.x python3 collectors/keydash_push.py
 
-# 每日 00:00 生成昨日汇总
+# 每日 00:00 生成昨日汇总（纯文本）
 report/daily_usage_report.sh
+
+# 日报 CLI：stdout 文本（默认）或 --json，供 agent/cron 调用
+python3 report/daily_report.py
 
 # 月度对账：usage store vs 日志真值（偏差 >1% 报警）
 report/usage_store_reconcile.sh
@@ -114,8 +119,8 @@ report/usage_store_reconcile.sh
 
 - **单一实现防漂移**：日级总数以 `ai_usage_summary.py` 家族为唯一事实源，
   小时分布、排行、趋势图均复用同一批底层采集器，不做并行实现。
-- **防双计**：WorkBuddy 按 `messageId` 去重 + 日台账幂等；mini 多机合并
-  「先减后加」可任意重跑；月度对账脚本独立断言防 store 污染潜伏。
+- **防双计**：WorkBuddy 按 `messageId` 去重 + 日台账幂等；月度对账脚本
+  独立断言防 store 污染潜伏。
 - **失败语义**：采集失败保留上次数据并在 UI 标注快照时间，不崩溃不通知；
   cron 出口恒 exit 0（watchdog 静默约定）。
 - **出网最小化**：事件驱动刷新只允许本地读取，额度探针严格按用户设置频率出网。

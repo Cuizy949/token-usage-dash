@@ -17,9 +17,7 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -35,33 +33,25 @@ LINE_RE = re.compile(
     r"provider=(?P<provider>.+?) in=(?P<in>\d+) out=(?P<out>\d+) total=(?P<total>\d+)"
 )
 ZCODE_DB = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
-HERMES_STORE_DB = os.path.expanduser("~/.hermes/hermes_usage_store.sqlite3")
+HERMES_STORE_DB = os.path.join(
+    os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+    "hermes_usage_store.sqlite3")
 CACHE_RE = re.compile(r"cache=(?P<cache>\d+)/(?P<in2>\d+)")
 # 物理日志边界用：日志头行 = 日期 + 完整时间戳起头（SR1-11：裸日期行
 # 可能是消息正文/导出文本，不得参与边界计算）
 _PHYS_HEAD_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,\s]")
 LOCAL_TZ = datetime.now().astimezone().tzinfo  # 系统本地时区
 
-# rollout 文件读取：.jsonl 直读；.jsonl.zst 经 zstd 解压（Codex Desktop 会把
-# archived_sessions 压成 .zst，只 glob .jsonl 会整类静默漏扫——2026-10 实测
-# 10 月漏 ~25 亿）。zstd 缺失或解压失败返回 None，调用方计数并告警，不静默。
-ZSTD_BIN = shutil.which("zstd") or "/opt/homebrew/bin/zstd"
-
-def read_rollout(fp: str):
-    """返回 rollout 文件的行列表；失败返回 None。"""
-    if not fp.endswith(".zst"):
-        try:
-            with open(fp, errors="ignore") as fh:
-                return fh.readlines()
-        except OSError:
-            return None
-    try:
-        r = subprocess.run([ZSTD_BIN, "-dc", fp], capture_output=True, timeout=120)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode("utf-8", "ignore")[:120])
-        return r.stdout.decode("utf-8", "ignore").splitlines()
-    except Exception:
-        return None
+# rollout 文件读取（.jsonl 直读 / .jsonl.zst 经 zstd 解压）复用兄弟模块
+# codex_usage.read_rollout——单一实现防漂移；zstd 缺失或解压失败返回 None，
+# 调用方计数并告警，不静默。
+def _codex_usage_mod():
+    spec = importlib.util.spec_from_file_location(
+        "codex_usage", os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "codex_usage.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 # model -> {"total": int, "tools": {tool: {"calls": int, "in": int, "out": int, "cache": int}}}
 AGG = defaultdict(lambda: {"total": 0, "tools": defaultdict(lambda: {"total": 0, "calls": 0, "in": 0, "out": 0, "cache": 0})})
@@ -192,6 +182,7 @@ def codex():
     # mtime 预过滤（仅窗口模式）：文件 mtime ≥ 其内部最后事件的写/归档时间，
     # 含窗口内事件的文件 mtime 必然 ≥ 窗口起点（.zst 的 mtime = 归档时间，
     # 同样晚于其内全部事件），故该过滤不会漏文件；留 1h 余量防时钟/DST 抖动。
+    read_rollout = _codex_usage_mod().read_rollout
     cutoff = WIN_START.timestamp() - 3600 if WIN_START else None
     pats = ("~/.codex/sessions/*/*/*/rollout-*.jsonl",
             "~/.codex/sessions/*/*/*/rollout-*.jsonl.zst",
@@ -268,7 +259,7 @@ def codex():
         _spec = importlib.util.spec_from_file_location(
             "codex_audit_scanner",
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "../../codex-usage-stats/scripts/codex_audit_scanner.py"))
+                         "codex_audit_scanner.py"))
         _cas = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_cas)
         _naudit = 0
@@ -411,22 +402,23 @@ def fmt_wan(n: int) -> str:
     return f"{n/1e4:.1f}万"
 
 # ---- 静态快速路径（2026-09-04）----
-# 总排行榜 = 静态基线（归档起点 08-14 之前的不可变数据，一次性固化）
-# + 归档 JSON 的 models 字段（08-14 → 昨日 23:59）。O(1)，无需扫描源数据。
-# 基线由 tools/gen_prearchive_baseline.py 生成（含个人历史数据，不入库）；
-# 位置经环境变量 AIUSD_PREARCHIVE_BASELINE 指定，缺省回退 Hermes 原位。
+# 总排行榜 = 静态基线（归档起点之前的不可变数据，一次性固化）
+# + 归档 JSON 的 models 字段（归档起点 → 昨日 23:59）。O(1)，无需扫描源数据。
+# 基线经环境变量 AIUSD_PREARCHIVE_BASELINE 指定（含个人历史数据，自行生成、
+# 不随仓库分发）；未设置 → 无快速路径，回退全量扫描。
 # 仅当池映射/重命名规则变更时才需重生成。
-BASELINE = os.environ.get("AIUSD_PREARCHIVE_BASELINE") or os.path.expanduser(
-    "~/.hermes/scripts/usage_prearchive_models.json")
+BASELINE = os.environ.get("AIUSD_PREARCHIVE_BASELINE") or ""
 ARCHIVE_DIR = os.path.join(
     aiusd_config.NAS_VOLUME or "/Volumes/UNSET",
     "Agent", "Program", "Agent token usage", "agent usage")
 
 
 def static_rank():
-    """返回 {model: {"total": int, "last": "YYYY-MM-DD"}}；基线缺失/
-    损坏时返回 None（上层回退扫描）。last = 该模型在基线/归档中最后出现
+    """返回 {model: {"total": int, "last": "YYYY-MM-DD"}}；基线未设置/
+    缺失/损坏时返回 None（上层回退扫描）。last = 该模型在基线/归档中最后出现
     的日期（对 0-token 调用同样计为调用日）。"""
+    if not BASELINE:
+        return None
     try:
         base = json.load(open(BASELINE))
     except Exception:

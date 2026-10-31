@@ -16,6 +16,7 @@ quota_snapshot_ts 在出口处 pop 掉，Swift 卡片只显示「重置」）。
 独立运行：python3 claude_quota.py → 打印 JSON。
 """
 import datetime
+import getpass
 import glob
 import json
 import math
@@ -30,7 +31,7 @@ USAGE_LOG = os.path.join(HOME, '.claude/usage.log')
 PROJECTS_DIR = os.path.join(HOME, '.claude/projects')
 CACHE_FILE = os.path.join(HOME, '.claude/.claude_quota_cache.json')
 KEYCHAIN_SERVICE = 'Claude Code-credentials'
-KEYCHAIN_ACCOUNT = os.environ.get('USER') or 'czy'
+KEYCHAIN_ACCOUNT = os.environ.get('USER') or getpass.getuser()
 CRED_FILE = os.path.join(HOME, '.claude/.credentials.json')
 
 ACTIVITY_WINDOW_MIN = 10         # 门控③：usage.log 近 N 分钟视为 CLI 刚刷新

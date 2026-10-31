@@ -21,15 +21,13 @@
   - 归档缺失(如 NAS 未挂载)的日期 → 跳过并在 stderr 报告,绝不补 0
 
 说明:
-  - HTML 默认透明背景 + app 主题变量(--foreground 等),供 Hermes 桌面
-    ::preview 内联;`?theme=light|dark` 触发导出模式(固定配色 + 实底),
-    独立浏览器打开/转 PNG/飞书卡片用(否则 fallback 浅灰字在白底上不可读)。
-  - PNG 走本机 Chrome headless;生成后可经飞书 im.v1.image.create 上传拿
-    image_key,再由卡片 img 组件引用(见 model-usage-ranking skill)。
+  - HTML 默认透明背景 + app 主题变量(--foreground 等),供桌面 app 内联
+    预览;`?theme=light|dark` 触发导出模式(固定配色 + 实底),独立浏览器
+    打开/转 PNG 用(否则 fallback 浅灰字在白底上不可读)。
+  - PNG 走本机 Chrome headless。
   - 纯 stdlib,只读,不调 LLM。
 """
 import argparse
-import base64
 import importlib.util
 import json
 import os
@@ -46,7 +44,6 @@ ARCHIVE_DIR = os.path.join(
     aiusd_config.NAS_VOLUME or "/Volumes/UNSET", "Agent", "Program",
     "Agent token usage", "agent usage")
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-HERMES_ICON = os.path.expanduser("~/.hermes/hermes-agent/website/static/img/apple-touch-icon.png")
 TRAEE = os.path.join(HERE, "trae_usage.py")
 # Codex 风格高辨识调色板:蓝/橙/绿/粉/紫/青/金/红 打头(前 8 色相拉满),
 # 后接长尾延展色(默认隐藏的系列被图例点开时才用得到)
@@ -54,7 +51,6 @@ PALETTE = ["#3D8BFD", "#EE8A3C", "#3E9B4F", "#E8639C", "#8C5CE8",
            "#00A6C8", "#D9A514", "#D64545", "#9AA0A6", "#5E6AD2",
            "#14B8A6", "#A0785C", "#7CB342", "#C247A8", "#64B5F6"]
 ZERO_KEYS = {"trae 原生积分"}  # 0-token 计数键,不入图
-MINI_RE = re.compile(r"\s*\(mini\)$")
 
 
 def load_rank_module():
@@ -67,9 +63,8 @@ def load_rank_module():
 
 
 def load_workbuddy_module():
-    """载入 workbuddy_usage.py（projects jsonl 主源，与日报归档链路同源）。"""
-    path = os.path.join(HERE, "..", "..", "workbuddy-usage", "scripts",
-                        "workbuddy_usage.py")
+    """载入 workbuddy_usage.py 兄弟模块（projects jsonl 主源，与日报归档链路同源）。"""
+    path = os.path.join(HERE, "workbuddy_usage.py")
     if not os.path.exists(path):
         print(f"[WorkBuddy] ⚠ 脚本未找到: {path}", file=sys.stderr)
         return None
@@ -90,7 +85,7 @@ def live_trae(date_str):
     正确解析——失败/格式漂移绝不能编码成普通 0。
     """
     try:
-        r = subprocess.run(["/usr/local/bin/python3", TRAEE, "--date", date_str],
+        r = subprocess.run([sys.executable, TRAEE, "--date", date_str],
                            capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             print(f"[Trae] ⚠ 实时采集失败(rc={r.returncode},按 0 计,不静默): "
@@ -126,7 +121,7 @@ def live_day(rank, date_str):
     """实时扫描单日(date_str, 本地日)的 (models, tools) 两个 {name: tokens}。
 
     复用 rank 模块的聚合器与解析函数,把窗口设成该日 00:00→次日 00:00。
-    tools 已把 `Xxx (mini)` 并回主工具名。Trae 源 rank 没有,单独补采。
+    Trae 源 rank 没有,单独补采。
     """
     from datetime import datetime, timedelta
     d0 = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=rank.LOCAL_TZ)
@@ -148,7 +143,7 @@ def live_day(rank, date_str):
         key = model.casefold()
         models[key] = models.get(key, 0) + a["total"]
         for tname, tv in a["tools"].items():
-            tn = MINI_RE.sub("", tname)
+            tn = tname
             if tn == "Hermes":
                 tn = "Hermes Agent"  # rank 内部工具名与归档口径对齐
             tools[tn] = tools.get(tn, 0) + tv["total"]
@@ -216,8 +211,7 @@ def load_archive(month, dates):
             if "error" in t:
                 errs.append(name)
                 continue
-            tn = MINI_RE.sub("", name)
-            t2[tn] = t2.get(tn, 0) + (t.get("total") or 0)
+            t2[name] = t2.get(name, 0) + (t.get("total") or 0)
         data[d] = {"models": m2, "tools": t2}
         if errs:
             partial[d] = errs
@@ -297,11 +291,9 @@ def _jso(obj) -> str:
 
 
 def render_html(ranges, default_range, palette_models, palette_tools,
-                icon_uri="", partial_dates=()):
+                partial_dates=()):
     r0 = ranges[default_range]
     grand = sum(r0["totals"])
-    brand_html = (f'<img src="{icon_uri}" alt="Hermes">' if icon_uri else "") + \
-        '<span>由 <b>Hermes Agent</b> 统计制图</span>'
 
     export_hook = '''<script>
 // 独立导出模式(?theme=light|dark):固化配色,不依赖 app 注入的主题变量
@@ -315,23 +307,14 @@ def render_html(ranges, default_range, palette_models, palette_tools,
   for (const k in M) r.setProperty(k, M[k]);
   document.body.style.background = M["--card"];
   document.body.style.padding = "18px 22px 16px";
-  // 署名行:Hermes logo + 统计来源(仅导出图;图片无交互语境,标明产出方)
-  const brand = document.createElement("div");
-  brand.className = "brand";
-  brand.innerHTML = __BRAND__;
-  document.getElementById("hz-left").appendChild(brand);
   const st = document.createElement("style");
-  // 导出字号补偿:PNG 在聊天窗口里会被缩放显示,基础字号整体上调约一成半
+  // 导出字号补偿:PNG 会被缩放显示,基础字号整体上调约一成半
   st.textContent = "body{font-size:15px} h3{font-size:16px} .stat{font-size:16px} " +
     ".stat b{font-size:23px} #legend{font-size:15px} #legend i{width:13px;height:13px}" +
-    "text{font-size:13px} .seg{font-size:14px}" +
-    ".brand{display:flex;align-items:center;gap:9px;margin:0}" +
-    ".brand img{width:30px;height:30px;border-radius:7px}" +
-    ".brand span{font-size:15px;color:var(--muted-foreground,#888)} .brand b{font-weight:650;color:var(--foreground,#111)}" +
-    ".brand i{font-style:normal;color:var(--muted-foreground,#888)}";
+    "text{font-size:13px} .seg{font-size:14px}";
   document.head.appendChild(st);
 })();
-</script>'''.replace("__BRAND__", json.dumps(brand_html))
+</script>'''
 
     return f'''<!DOCTYPE html>
 <html lang="zh">
@@ -345,8 +328,6 @@ body {{ margin:0; padding:14px 16px 10px; color:var(--foreground, #ddd); font: 1
 .hz {{ display:flex; }}
 .stat {{ justify-self:end; font-size:14px; white-space:nowrap; font-variant-numeric:tabular-nums; }}
 .stat b {{ font-size:19px; font-weight:650; }}
-.brand {{ margin:0; }}
-.brand, .hz .brand {{ display:flex; align-items:center; gap:9px; }}
 .bar {{ transition: opacity .15s; }}
 .segrow {{ display:flex; justify-content:flex-end; gap:14px; margin:10px 0 2px; }}
 .seg {{ display:inline-flex; background:var(--muted-foreground,#888); border-radius:10px; padding:3px; opacity:.92; }}
@@ -633,7 +614,7 @@ def main():
     ap.add_argument("--days", type=int, default=None, help="只取该月前 N 天(默认整月到今天)")
     ap.add_argument("--out", default=None, help="输出 HTML 路径(默认工作目录 <月>token用量趋势.html)")
     ap.add_argument("--png", action="store_true", help="另出 PNG(Chrome headless,导出配色)")
-    ap.add_argument("--png-height", type=int, default=545, help="PNG 视口高度(默认 545,含署名行)")
+    ap.add_argument("--png-height", type=int, default=545, help="PNG 视口高度(默认 545)")
     ap.add_argument("--png-range", choices=["all", "r7"], default="all",
                     help="PNG 截取的窗口(默认 all=查询窗口本身,与请求口径一致)")
     args = ap.parse_args()
@@ -664,11 +645,8 @@ def main():
     palette_models = {m: PALETTE[i % len(PALETTE)] for i, m in enumerate(all_models)}
     palette_tools = {t: PALETTE[i % len(PALETTE)] for i, t in enumerate(all_tools)}
     default_range = args.png_range if args.png_range in ranges else "all"
-    icon_uri = ""
-    if os.path.exists(HERMES_ICON):
-        icon_uri = "data:image/png;base64," + base64.b64encode(open(HERMES_ICON, "rb").read()).decode()
     html = render_html(ranges, default_range, palette_models, palette_tools,
-                       icon_uri, partial_dates=partial.keys())
+                       partial_dates=partial.keys())
     out = args.out or os.path.join(os.getcwd(), f"{month}token用量趋势.html")
     open(out, "w").write(html)
     grand = sum(sum(data[d]["models"].values()) for d in dates)

@@ -11,10 +11,11 @@ Usage:
 Reads ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl AND
 ~/.codex/archived_sessions/rollout-*.jsonl (Codex Desktop moves closed
 sessions into archived_sessions; skipping it silently undercounts the day).
-Additionally scans ephemeral `codex exec` batch runs (workflow audit logs,
-default ~/Work/Codex/*/outputs/audit_logs): those runs use --ephemeral and
-NEVER write rollout files to sessions/, so audit_logs is their only token
-record. Non-ephemeral runs are skipped there to avoid double counting.
+Additionally scans ephemeral `codex exec` batch runs (workflow audit logs;
+roots from --audit-root or env AIUSD_CODEX_AUDIT_ROOTS): those runs use
+--ephemeral and NEVER write rollout files to sessions/, so audit_logs is
+their only token record. Non-ephemeral runs are skipped there to avoid
+double counting.
 No network, no credentials.
 
 Model attribution: `token_count` events carry NO model field. The model is
@@ -71,13 +72,6 @@ POOL_MODEL = {
     "codex_bengalfox": "gpt-5.6-sol",
     "codex": "codex-pool(gpt-5.4/5.5)",
 }
-
-# ephemeral exec 批量任务的 audit log 根目录（可被 --audit-root 覆盖）。
-# 目录层级：<root>/<项目>/**/audit_logs/<run_id>/；run 目录直接含
-# workflow.json + state/。仅统计 workflow.json.ephemeral == true 的 run：
-# 非 ephemeral 的 exec 会写 rollout 文件进 sessions/，再算一遍就是重复
-# 计数（2026-09-07 实测确认）。
-AUDIT_ROOTS = ["~/Work/Codex/*/outputs/audit_logs/*"]
 
 
 def fmt(n: int) -> str:

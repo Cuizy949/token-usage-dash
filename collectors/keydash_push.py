@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,7 +32,10 @@ sys.path.insert(0, REPO)
 import aiusd_config  # noqa: E402
 
 HOME = os.path.expanduser('~')
-CODEX_BIN = os.path.expanduser('~/.local/bin/codex')
+# Codex CLI 路径（额度探针 app-server 用）：env 覆盖 → PATH 查找 → 常见安装位兜底
+CODEX_BIN = (os.environ.get('AIUSD_CODEX_BIN')
+             or shutil.which('codex')
+             or os.path.expanduser('~/.local/bin/codex'))
 SUMMARY_SCRIPT = os.path.join(REPO, 'collectors', 'ai_usage_summary.py')
 ASSETS = aiusd_config.ASSETS_DIR
 STATE_FILE = os.path.join(aiusd_config.STATE_DIR, 'keydash_last_state')
@@ -42,107 +46,105 @@ DEVICE_URL = f'http://{aiusd_config.DEVICE_HOST}/image/upload' if aiusd_config.D
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from claude_quota import fetch_claude_quota  # noqa: E402
+from claude_quota import fetch_claude_quota, fmt_reset  # noqa: E402
 from workbuddy_usage import collect_workbuddy  # noqa: E402
-
-WEEKDAY_CN = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
-
-def fmt_reset(dt):
-    """重置时间统一格式：MM-dd HH:MM 周X（2026-09-14 用户要求补星期）。"""
-    return dt.strftime('%m-%d %H:%M') + ' ' + WEEKDAY_CN[dt.weekday()]
 
 def fetch_quota_via_appserver():
     """官方 app-server JSON-RPC：account/rateLimits/read 查询实时周额度。
-    返回 (quota_left, reset_str) 或 None（启动/调用失败时回退日志扫描）。
-    不创建对话 turn，纯只读查询。
+
+    返回 (used_percent:int, reset_str:str) 或 None（两次尝试均失败，调用方
+    回退日志快照）。不创建对话 turn，纯只读查询。
+    唯一实现：report/daily_report.py 经 import 复用，不要并行再写一份。
     2026-08-18 修复：原实现固定 sleep(1.5+2+2.5) 盲等响应，app-server
     冷启动慢（Codex 桌面 app 繁忙）时 read 响应超 6s 未到即被 terminate
     → 静默回退日志快照，屏上显示滞后数小时的旧额度（实测 14% vs 实时 12%）。
     现改为条件等待：initialize/read 各自等响应到达（最长 10s），并 kill 兜底回收进程。"""
     import threading as _t
-    try:
-        proc = subprocess.Popen(
-            [CODEX_BIN, 'app-server', '--listen', 'stdio://'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, bufsize=1,
-        )
-        responses = {}
-        cv = _t.Condition()
+    for _attempt in (1, 2):   # 冷启动慢时首查可能超时，重试一次
+        try:
+            proc = subprocess.Popen(
+                [CODEX_BIN, 'app-server', '--listen', 'stdio://'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1,
+            )
+            responses = {}
+            cv = _t.Condition()
 
-        def _reader():
-            try:
-                while True:
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    try:
-                        msg = json.loads(line)
-                        if 'id' in msg:
-                            with cv:
-                                responses[msg['id']] = msg
-                                cv.notify_all()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            def _reader():
+                try:
+                    while True:
+                        line = proc.stdout.readline()
+                        if not line:
+                            break
+                        try:
+                            msg = json.loads(line)
+                            if 'id' in msg:
+                                with cv:
+                                    responses[msg['id']] = msg
+                                    cv.notify_all()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
-        rt = _t.Thread(target=_reader, daemon=True)
-        rt.start()
+            rt = _t.Thread(target=_reader, daemon=True)
+            rt.start()
 
-        def _send(method, params, rid):
-            proc.stdin.write(json.dumps(
-                {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + '\n')
-            proc.stdin.flush()
+            def _send(method, params, rid):
+                proc.stdin.write(json.dumps(
+                    {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + '\n')
+                proc.stdin.flush()
 
-        def _wait(rid, timeout):
-            """等指定 id 的响应到达；返回响应 dict 或 None（超时）。"""
-            deadline = time.time() + timeout
-            with cv:
-                while rid not in responses:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        return None
-                    cv.wait(min(remaining, 0.5))
-                return responses[rid]
+            def _wait(rid, timeout):
+                """等指定 id 的响应到达；返回响应 dict 或 None（超时）。"""
+                deadline = time.time() + timeout
+                with cv:
+                    while rid not in responses:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            return None
+                        cv.wait(min(remaining, 0.5))
+                    return responses[rid]
 
-        def _cleanup():
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.kill()
-                proc.wait(timeout=3)
-            except Exception:
-                pass
+            def _cleanup():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
 
-        time.sleep(1.0)  # 等进程就绪
-        _send("initialize", {"protocolVersion": 1,
-                             "clientInfo": {"name": "hermes-keydash", "version": "1.0"},
-                             "capabilities": {}}, 1)
-        if _wait(1, 10.0) is None:      # initialize 无回执 → 启动失败
+            time.sleep(1.0)  # 等进程就绪
+            _send("initialize", {"protocolVersion": 1,
+                                 "clientInfo": {"name": "aiusd", "version": "1.0"},
+                                 "capabilities": {}}, 1)
+            if _wait(1, 10.0) is None:      # initialize 无回执 → 启动失败
+                _cleanup()
+                continue
+            _send("account/rateLimits/read", {}, 2)
+            rl_resp = _wait(2, 10.0)        # read 响应最长等 10s（原 2.5s 盲等）
             _cleanup()
-            return None
-        _send("account/rateLimits/read", {}, 2)
-        rl_resp = _wait(2, 10.0)        # read 响应最长等 10s（原 2.5s 盲等）
-        _cleanup()
-        if rl_resp is None:
-            return None
-        rl = (rl_resp.get('result') or {}).get('rateLimits') or {}
-        prim = rl.get('primary') or {}
-        used = prim.get('usedPercent')
-        resets = prim.get('resetsAt')
-        if used is None:
-            return None
-        quota_left = int(round(100 - float(used)))
-        if resets:
-            local_tz = datetime.datetime.now().astimezone().tzinfo
-            reset_str = fmt_reset(datetime.datetime.fromtimestamp(resets, local_tz))
-        else:
-            reset_str = '--'
-        return (quota_left, reset_str)
-    except Exception:
-        return None
+            if rl_resp is None:
+                continue
+            rl = (rl_resp.get('result') or {}).get('rateLimits') or {}
+            prim = rl.get('primary') or {}
+            used = prim.get('usedPercent')
+            resets = prim.get('resetsAt')
+            if used is None:
+                continue
+            used_pct = int(round(float(used)))
+            if resets:
+                local_tz = datetime.datetime.now().astimezone().tzinfo
+                reset_str = fmt_reset(datetime.datetime.fromtimestamp(resets, local_tz))
+            else:
+                reset_str = '--'
+            return (used_pct, reset_str)
+        except Exception:
+            continue
+    return None
 
 
 
@@ -199,16 +201,12 @@ def _quota_from_logs():
 def collect_quota_only():
     """仅额度（桌面悬浮卡高频模式专用）：Codex 周额度 + ZCode 周窗余量。
 
-    Codex：app-server 实时 + 日志快照 fallback（两次失败→None）。
+    Codex：app-server 实时（内置两次重试）+ 日志快照 fallback（均失败→None）。
     ZCode：官方监控接口实时查询（失败→缺键，Swift 端保留旧值）。
     """
-    official = None
-    for attempt in (1, 2):
-        official = fetch_quota_via_appserver()
-        if official is not None:
-            break
+    official = fetch_quota_via_appserver()
     if official is not None:
-        out = {'quota_left': official[0], 'reset': official[1],
+        out = {'quota_left': 100 - official[0], 'reset': official[1],
                'quota_snapshot_ts': None}
     else:
         snap = _quota_from_logs()
@@ -244,6 +242,7 @@ def fetch_zcode_quota():
     返回 {"level": str, "windows": [{"label","used","left","reset"}]} 或 None。
     unit=3 → 5 小时窗，unit=6 → 周窗；percentage 为已用 %，nextResetTime
     为 epoch 毫秒。
+    唯一实现：report/daily_report.py 经 import 复用，不要并行再写一份。
     """
     cfg_path = os.path.expanduser('~/.zcode/v2/config.json')
     try:
@@ -279,7 +278,7 @@ def fetch_zcode_quota():
             })
         if not windows:
             return None
-        return {'level': (body.get('data') or {}).get('level') or '',
+        return {'level': ((body.get('data') or {}).get('level') or '').strip(),
                 'windows': windows}
     except Exception:
         return None
@@ -308,12 +307,8 @@ def collect(tools=None, include_quota=True):
     # 单工具/高频模式跳过（避免频繁起进程），额度随统一 tick 的全量刷新更新
     official = None
     if not partial and include_quota:
-        for attempt in (1, 2):   # 2026-08-18：app-server 冷启动慢时首查可能超时，重试一次
-            official = fetch_quota_via_appserver()
-            if official is not None:
-                break
-        if official is None:
-            pass  # 二次失败 → 下方日志快照 fallback（会标注采样时间，屏上区分实时/快照）
+        # 内置两次重试；失败 → 下方日志快照 fallback（会标注采样时间，屏上区分实时/快照）
+        official = fetch_quota_via_appserver()
 
     cmd = [aiusd_config.PYTHON, SUMMARY_SCRIPT]
     if partial:
@@ -350,7 +345,8 @@ def collect(tools=None, include_quota=True):
 
     # 官方 app-server 接口优先（实时，无采样空窗）；失败才用 summary/日志值
     if official:
-        data['codex']['quota_left'], data['codex']['reset'] = official
+        data['codex']['quota_left'] = 100 - official[0]
+        data['codex']['reset'] = official[1]
 
     # 跨日 fallback（全量模式；单工具模式跳过——额度由统一 tick 全量更新）
     if data['codex']['quota_left'] is None and not partial:
@@ -432,7 +428,7 @@ def collect(tools=None, include_quota=True):
 
     # 2026-08-31: ai_usage_summary 输出已从「三工具合计」改为「N工具合计」（随 TOOLS 注册动态）
     # 2026-09-27: TOOLS 已注册 WorkBuddy → N工具合计已含 WB，不再二次合并
-    # （旧注释的 tokens_raw 合并逻辑已删：WB 进 summary 合计后二次相加 = 双计）
+    # （WB 若在 summary 合计外再单独相加 = 双计，直接取 N工具合计即可）
     mt = re.search(r'(\d+)工具合计: (\S+) tokens', out)
     data['total'] = mt.group(2) if mt else '--'
     if partial:

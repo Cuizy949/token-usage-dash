@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Umbrella daily token report: Codex + Claude Code + Hermes Agent + Trae.
+"""Umbrella daily token report: Codex + Claude Code + Hermes Agent + Trae /
+ZCode / WorkBuddy.
 
-Orchestrates the four underlying skills' scripts (no parsing logic of its
-own beyond reading their stdout):
+Orchestrates the six sibling collectors (no parsing logic of its own beyond
+reading their stdout); all scripts live flat in collectors/:
 
-  - codex-usage-stats/scripts/codex_usage.py          (today + weekly quota)
-  - claude-code-usage-stats/scripts/cc_usage.py       (today, per model)
-  - hermes-usage-stats/scripts/hermes_usage.py        (today, live parse)
-  - trae-usage-stats/scripts/trae_usage.py            (today, local SQLite)
+  - codex_usage.py     (today + weekly quota)
+  - cc_usage.py        (today, per model)
+  - hermes_usage.py    (today, live parse)
+  - trae_usage.py      (today, local SQLite)
+  - zcode_usage.py     (today, local SQLite)
+  - workbuddy_usage.py (today, session jsonl)
 
 Usage:
     python3 ai_usage_summary.py [--date YYYY-MM-DD]
@@ -20,7 +23,6 @@ If a script's output format changes and parsing breaks, the raw output is
 printed as fallback (no silent data loss).
 """
 import argparse
-import glob
 import os
 import re
 import subprocess
@@ -28,7 +30,6 @@ import sys
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CATEGORY_DIR = os.path.dirname(os.path.dirname(HERE))  # .../autonomous-ai-agents
 
 TOOLS = [
     {"name": "Codex", "skill": "codex-usage-stats",
@@ -80,17 +81,9 @@ def fmt_yi(n) -> str:
 
 
 def find_script(skill: str, rel: str):
-    # 扁平布局（开源仓库）：兄弟采集脚本与本文件同目录，优先
+    # 扁平布局：兄弟采集脚本与本文件同目录（skill 参数保留以兼容 TOOLS 表）
     flat = os.path.join(HERE, os.path.basename(rel))
-    if os.path.exists(flat):
-        return flat
-    p = os.path.join(CATEGORY_DIR, skill, rel)
-    if os.path.exists(p):
-        return p
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    cands = glob.glob(os.path.join(home, "skills", "**", skill, rel),
-                      recursive=True)
-    return cands[0] if cands else None
+    return flat if os.path.exists(flat) else None
 
 
 def first_int(pattern: str, text: str):
@@ -281,8 +274,7 @@ def main() -> None:
         # 不再因「有部分 stdout」就采信——底层可能先打印摘要再在后续
         # 库/文件读取时报错。部分输出仅作诊断展示，不入合计。
         if not ok:
-            import re as _re
-            _ctl = _re.compile(r"[\x00-\x1f\x7f-\x9f]")
+            _ctl = re.compile(r"[\x00-\x1f\x7f-\x9f]")
             print(f"  ⚠ 无法获取: {_ctl.sub('', err.strip()[:400]) or '未知错误'}")
             if out.strip():
                 # SEC-C-03：底层输出是外部数据，回显过滤控制字符
@@ -294,8 +286,7 @@ def main() -> None:
         parsed = PARSERS[name](out)
         if parse_broken(name, parsed, out):
             # Parsing broke (format changed?) — dump raw output as fallback.
-            import re as _re2
-            _ctl2 = _re2.compile(r"[\x00-\x1f\x7f-\x9f]")
+            _ctl2 = re.compile(r"[\x00-\x1f\x7f-\x9f]")
             print("  ⚠ 解析失败, 原始输出如下:")
             print("  " + _ctl2.sub("", out.strip().replace("\n", "\n  ")))
             print()

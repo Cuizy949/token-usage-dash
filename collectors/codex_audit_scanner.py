@@ -20,10 +20,11 @@ import os
 from datetime import datetime, timezone
 
 # run 目录 glob（<root>/<项目>/outputs/audit_logs/<run_id>/）。
-# 新项目路径加进这个列表即可被所有统计脚本覆盖。
-AUDIT_ROOTS = [
-    "~/Work/Codex/*/outputs/audit_logs/*",
-]
+# 根路径来自环境变量 AIUSD_CODEX_AUDIT_ROOTS（冒号分隔，可含通配符）；
+# 未设置时不扫该源——ephemeral exec 不写 sessions/，其用量会缺席，
+# 需要统计批量任务的用户自行指定。codex_usage.py 的 --audit-root 可叠加。
+AUDIT_ROOTS = [r for r in os.environ.get("AIUSD_CODEX_AUDIT_ROOTS", "").split(":")
+               if r]
 
 TOKEN_KEYS = (
     "input_tokens",
