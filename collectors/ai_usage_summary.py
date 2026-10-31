@@ -32,18 +32,12 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 TOOLS = [
-    {"name": "Codex", "skill": "codex-usage-stats",
-     "script": "scripts/codex_usage.py", "timeout": 180},
-    {"name": "Claude Code", "skill": "claude-code-usage-stats",
-     "script": "scripts/cc_usage.py", "timeout": 120},
-    {"name": "Hermes Agent", "skill": "hermes-usage-stats",
-     "script": "scripts/hermes_usage.py", "timeout": 60},
-    {"name": "Trae", "skill": "trae-usage-stats",
-     "script": "scripts/trae_usage.py", "timeout": 30},
-    {"name": "ZCode", "skill": "zcode-usage-stats",
-     "script": "scripts/zcode_usage.py", "timeout": 30},
-    {"name": "WorkBuddy", "skill": "workbuddy-usage",
-     "script": "scripts/workbuddy_usage.py", "timeout": 30},
+    {"name": "Codex", "script": "codex_usage.py", "timeout": 180},
+    {"name": "Claude Code", "script": "cc_usage.py", "timeout": 120},
+    {"name": "Hermes Agent", "script": "hermes_usage.py", "timeout": 60},
+    {"name": "Trae", "script": "trae_usage.py", "timeout": 30},
+    {"name": "ZCode", "script": "zcode_usage.py", "timeout": 30},
+    {"name": "WorkBuddy", "script": "workbuddy_usage.py", "timeout": 30},
 ]
 
 # CLI 简洁名 → 段落名
@@ -80,10 +74,10 @@ def fmt_yi(n) -> str:
     return fmt(n)
 
 
-def find_script(skill: str, rel: str):
-    # 扁平布局：兄弟采集脚本与本文件同目录（skill 参数保留以兼容 TOOLS 表）
-    flat = os.path.join(HERE, os.path.basename(rel))
-    return flat if os.path.exists(flat) else None
+def find_script(rel: str):
+    # 扁平布局：兄弟采集脚本与本文件同目录
+    path = os.path.join(HERE, rel)
+    return path if os.path.exists(path) else None
 
 
 def first_int(pattern: str, text: str):
@@ -104,9 +98,9 @@ def first_str(pattern: str, text: str) -> str:
 
 def run_tool(tool, extra_args=None):
     """Run one underlying script; return (stdout, stderr, ok)."""
-    path = find_script(tool["skill"], tool["script"])
+    path = find_script(tool["script"])
     if not path:
-        return "", f"脚本未找到: {tool['skill']}/{tool['script']}", False
+        return "", f"脚本未找到: {tool['script']}", False
     try:
         r = subprocess.run(
             [sys.executable, path] + (extra_args or []),

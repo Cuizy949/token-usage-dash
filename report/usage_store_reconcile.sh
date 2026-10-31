@@ -1,7 +1,7 @@
 #!/bin/bash
 # 月度例检：hermes usage store vs 日志真值对账（2026-09-16 上线）
 #
-# no_agent cron watchdog 语义（见 hermes-cron-scripts skill）：
+# cron watchdog 语义：
 #   - store 健康 → 空 stdout + exit 0（静默，不打扰）
 #   - 不一致/脚本失败 → stderr 一行可读告警 + exit 1（触发 cron 错误告警）
 #
@@ -33,7 +33,7 @@ if [ $RC -ne 0 ]; then
     # 把不一致的天附在告警里，方便直接判断污染范围
     echo "⚠️ usage store 与日志真值不一致（需人工归因，勿直接 --rebuild）：" >&2
     echo "$OUT" | grep -E '✗|⚠' | head -20 >&2
-    echo "归因顺序：① 单日非整数比值多为日志轮转边界（该天=窗口最早日，store 完整而日志只剩尾部片段，属假阳性）② 连续多天精确 2.000 才是轮转双计复发 ③ 与 NAS 归档 hermes_models 交叉核对。确认 store 受污染再谈修复（--rebuild 会抹掉早于日志窗口的历史天），口径见 hermes-usage-stats skill" >&2
+    echo "归因顺序：① 单日非整数比值多为日志轮转边界（该天=窗口最早日，store 完整而日志只剩尾部片段，属假阳性）② 连续多天精确 2.000 才是轮转双计复发 ③ 与 NAS 归档 hermes_models 交叉核对。确认 store 受污染再谈修复（--rebuild 会抹掉早于日志窗口的历史天）" >&2
     exit 1
 fi
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-hour token distribution for one calendar day, per tool.
 
-供 daily_usage_card.py 的「今日速览」取高峰时段/主力工具；也可独立 CLI 查看。
+供 report/daily_report.py 的「今日速览」取高峰时段/主力工具；也可独立 CLI 查看。
 只做小时级分布，日级总数仍以 ai_usage_summary 家族脚本为唯一事实源——
 本脚本的各工具小时合计应与之对得上（coverage 不足时卡片会自动放弃
 高峰结论，绝不硬凑）。

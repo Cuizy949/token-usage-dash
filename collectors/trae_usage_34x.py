@@ -26,7 +26,7 @@
 
 输出格式与 trae_usage.py（旧扩展链路）逐行对齐：
 模型:/轮次/小计 + API 轮次:/合计 tokens:，ai_usage_summary.py 的
-parse_codex 可直接解析，daily_usage_card.py / 日报 cron 无需任何改动。
+parse_codex 可直接解析，report/daily_report.py / 日报 cron 无需任何改动。
 
 用法：
     python3 trae_usage_34x.py [--date YYYY-MM-DD]   # 默认今天（本地时间）
