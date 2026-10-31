@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+__pycache__/
+*.pyc
+
+# 构建产物
+dash/ai_usage_dash
+*.o
+
+# 个人配置与状态（不入库）
+.env
+config.local.*
+*.local.json
+
+# 图表/截图产物
+*.png.html
+tmp/

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- 模板：把 __REPO_PATH__ 替换为仓库实际路径后拷到
+     ~/Library/LaunchAgents/（建议 Label 用 com.<你的名字>.ai-usage-dash），
+     再 launchctl bootstrap gui/$(id -u) <plist 路径>。
+     环境变量见仓库根 aiusd_config.py 文档（AIUSD_PYTHON / AIUSD_DEVICE_HOST /
+     AIUSD_NAS_VOLUME / AIUSD_STATE_DIR）。 -->
+<dict>
+    <key>Label</key>
+    <string>ai.usagedash.desktop</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_PATH__/dash/ai_usage_dash</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- <key>AIUSD_PYTHON</key><string>/path/to/venv/bin/python3</string> -->
+        <!-- <key>AIUSD_DEVICE_HOST</key><string>192.168.x.x</string> -->
+        <!-- <key>AIUSD_NAS_VOLUME</key><string>/Volumes/your-nas</string> -->
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
