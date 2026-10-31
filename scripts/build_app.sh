@@ -27,8 +27,11 @@ for arg in "$@"; do
 done
 
 rm -rf "$APP"
+# MacOS/ 只放主可执行文件；Python 层与图标一律进 Resources/（标准资源位）。
+# codesign 把 Contents/ 根与 MacOS/ 下的散文件视为嵌套代码对象，
+# 放 Resources/ 才能通过 bundle 级 ad-hoc 签名。
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
-         "$APP/Contents/collectors" "$APP/Contents/assets/icons"
+         "$APP/Contents/Resources/collectors" "$APP/Contents/Resources/assets/icons"
 
 # ---- Swift 主程序（arm64 产物自动 ad-hoc 签名；x86_64 需显式 --签名=adhoc）----
 ARCH_FLAGS=()
@@ -41,14 +44,15 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   codesign --force --sign - "$APP/Contents/MacOS/$APP_NAME"
 fi
 
-# ---- 数据桥 + 采集层 + 配置（bundle 内相对定位与仓库布局同构）----
-# Swift 以 <execDir>/../collectors 与 <execDir>/../assets/icons 定位；
-# Python 以 Contents/ 为 REPO 根 import aiusd_config。
-cp "$REPO/dash/ai_usage_fetch.py"    "$APP/Contents/MacOS/"
-cp "$REPO/aiusd_config.py"           "$APP/Contents/"
-cp "$REPO"/collectors/*.py           "$APP/Contents/collectors/"
-cp "$REPO"/assets/icons/*.png        "$APP/Contents/assets/icons/"
-chmod +x "$APP/Contents/collectors/"*.py
+# ---- 数据桥 + 采集层 + 配置（Python 侧整体放 Resources/）----
+# Swift 经 Layout 枚举双布局定位（仓库 dash/../ 与 bundle ../Resources/）；
+# Python 以 Resources/ 为 REPO 根（fetch 向上查找 collectors/ 即命中）。
+# .py 统一去执行位：python3 调用只需可读，执行位会被 codesign 视为代码对象。
+cp "$REPO/dash/ai_usage_fetch.py"    "$APP/Contents/Resources/"
+cp "$REPO/aiusd_config.py"           "$APP/Contents/Resources/"
+cp "$REPO"/collectors/*.py           "$APP/Contents/Resources/collectors/"
+cp "$REPO"/assets/icons/*.png        "$APP/Contents/Resources/assets/icons/"
+find "$APP" -name "*.py" -exec chmod 644 {} +
 
 # ---- Info.plist（LSUIElement：无 Dock 图标，与 setActivationPolicy(.accessory) 一致）----
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -89,7 +93,9 @@ if [[ -f "$REPO/assets/app-icon.png" ]]; then
   /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist"
 fi
 
-codesign --force --sign - "$APP" 2>/dev/null || true   # bundle 级 ad-hoc（arm64 兜底）
+# bundle 级 ad-hoc：成功后 codesign -dv 的 Identifier = CFBundleIdentifier；
+# 失败不阻断构建（本机双击/自编译场景无影响），但显式告警。
+codesign --force --sign - "$APP" 2>&1 || echo "⚠️ bundle 级 ad-hoc 签名失败（本机使用不受影响）"
 
 echo "✓ $APP"
 if [[ "$DMG" == 1 ]]; then

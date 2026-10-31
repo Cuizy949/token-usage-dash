@@ -70,6 +70,10 @@ scripts/build_app.sh --dmg         # 追加打包 DMG（分发用）
 Translocation（随机只读路径），launchd/菜单等功能可能异常。
 命令行用户的快捷姿势：`xattr -dr com.apple.quarantine /Applications/token-usage-dash.app`
 
+首次启动 Claude 额度探针时，macOS 可能弹出钥匙串授权窗口（app 读取
+`~/.claude` 下 OAuth 凭据需要）——点「始终允许」即可。这是本地凭据读取，
+app 不出网发送任何凭据（额度探针仅以该凭据请求 Anthropic 官方接口）。
+
 ### 方式三：裸跑采集链（不装 APP，纯 CLI）
 
 ```bash

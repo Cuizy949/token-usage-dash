@@ -112,6 +112,36 @@ struct DashData: Decodable {
     }
 }
 
+// MARK: - 布局定位（仓库裸跑与 .app bundle 双布局）
+enum BundleLayout {
+    static var execDir: String {
+        Bundle.main.executableURL?.deletingLastPathComponent().path ?? ""
+    }
+    /// 依次探测，返回第一个存在的路径（都不存在时返回末选，保持旧行为）
+    static func firstExisting(_ cands: [String]) -> String {
+        let fm = FileManager.default
+        for c in cands where fm.fileExists(atPath: c) { return c }
+        return cands.last ?? ""
+    }
+    /// Python 层与图标资源：仓库布局与本二进制同级（dash/../collectors），
+    /// bundle 布局在 Contents/Resources/（codesign 要求 Contents/ 根不放散文件）
+    static var fetchScript: String {
+        if let p = ProcessInfo.processInfo.environment["AIUSD_FETCH_SCRIPT"] { return p }
+        return firstExisting([execDir + "/ai_usage_fetch.py",
+                              execDir + "/../Resources/ai_usage_fetch.py"])
+    }
+    static var collectorsDir: String {
+        if let p = ProcessInfo.processInfo.environment["AIUSD_COLLECTORS_DIR"] { return p }
+        return firstExisting([execDir + "/../collectors",
+                              execDir + "/../Resources/collectors"])
+    }
+    static var assetsIconsDir: String {
+        if let p = ProcessInfo.processInfo.environment["AIUSD_ASSETS_DIR"] { return p }
+        return firstExisting([execDir + "/../assets/icons",
+                              execDir + "/../Resources/assets/icons"])
+    }
+}
+
 // MARK: - 数据采集（复用 keydash 采集脚本，后台线程执行）
 
 final class DataFetcher {
@@ -128,12 +158,7 @@ final class DataFetcher {
     }
     // ReportRunner 复用同一解释器解析
     var pythonPath: String { venvPython }
-    private var fetchScript: String {
-        let env = ProcessInfo.processInfo.environment
-        if let p = env["AIUSD_FETCH_SCRIPT"] { return p }
-        let execDir = Bundle.main.executableURL?.deletingLastPathComponent().path ?? ""
-        return execDir + "/ai_usage_fetch.py"
-    }
+    private var fetchScript: String { BundleLayout.fetchScript }
     private let fetchTimeout: TimeInterval = 300   // 覆盖 ai_usage_summary 最长 240s
     // 串行采集队列 + 按模式合并：修掉旧 running Bool 的两处问题——
     // ① 主线程(定时器/菜单)与 fs monitor queue 并发读写 Bool 的数据竞争；
@@ -179,6 +204,10 @@ final class DataFetcher {
         // 未设 AIUSD_PYTHON 时经 /usr/bin/env shim 走 PATH 里的 python3
         proc.arguments = usesEnvShim ? ["python3", fetchScript] + args
                                      : [fetchScript] + args
+        // 禁止子进程写 .pyc：避免运行时在 bundle Resources/ 里生成 __pycache__
+        var childEnv = ProcessInfo.processInfo.environment
+        childEnv["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc.environment = childEnv
 
         let outPipe = Pipe()
         proc.standardOutput = outPipe
@@ -406,10 +435,8 @@ enum Layout {
 enum LogoStore {
     static let shared: [String: NSImage] = {
         var m: [String: NSImage] = [:]
-        // 图标目录：相对本二进制定位（仓库布局 dash/../assets/icons），可用环境变量覆盖
-        let env = ProcessInfo.processInfo.environment
-        let execDir = Bundle.main.executableURL?.deletingLastPathComponent().path ?? ""
-        let dir = env["AIUSD_ASSETS_DIR"] ?? (execDir + "/../assets/icons")
+        // 图标目录：仓库/bundle 双布局定位（见 Layout），可用环境变量覆盖
+        let dir = BundleLayout.assetsIconsDir
         let files = ["codex": "codex-mark-hq.png",
                      "claude": "claude-512.png",
                      "hermes": "hermes-1024.png",
@@ -1190,14 +1217,10 @@ final class ReportWindowController {
 }
 
 /// 报表命令执行：与 DataFetcher 同一套解释器解析与仓库相对脚本定位
-final class ReportRunner {
-    static func scriptPath(_ name: String) -> String {
-        if let p = ProcessInfo.processInfo.environment["AIUSD_COLLECTORS_DIR"] {
-            return p + "/" + name
+    final class ReportRunner {
+        static func scriptPath(_ name: String) -> String {
+            BundleLayout.collectorsDir + "/" + name
         }
-        let execDir = Bundle.main.executableURL?.deletingLastPathComponent().path ?? ""
-        return execDir + "/../collectors/" + name
-    }
 
     static func dateStr(daysAgo: Int) -> String {
         let f = DateFormatter()
@@ -1214,6 +1237,9 @@ final class ReportRunner {
             proc.arguments = runner.usesEnvShim
                 ? ["python3", scriptPath] + args
                 : [scriptPath] + args
+            var childEnv = ProcessInfo.processInfo.environment
+            childEnv["PYTHONDONTWRITEBYTECODE"] = "1"
+            proc.environment = childEnv
             let outPipe = Pipe(), errPipe = Pipe()
             proc.standardOutput = outPipe
             proc.standardError = errPipe

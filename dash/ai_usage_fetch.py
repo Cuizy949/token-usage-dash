@@ -19,7 +19,19 @@ import os
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _find_repo_root():
+    """向上定位含 collectors/ 的目录，兼容两种布局：
+    - 仓库：dash/ai_usage_fetch.py → 根在上一级（与 collectors/ 同级）
+    - app bundle：Contents/ai_usage_fetch.py → 根即 Contents（collectors/ 就在此级）"""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(3):
+        if os.path.isdir(os.path.join(d, 'collectors')):
+            return d
+        d = os.path.dirname(d)
+    raise FileNotFoundError('collectors/ not found near ' + os.path.abspath(__file__))
+
+
+REPO = _find_repo_root()
 sys.path.insert(0, os.path.join(REPO, 'collectors'))
 from keydash_push import collect, collect_quota_only  # noqa: E402
 from claude_quota import fetch_claude_quota  # noqa: E402
