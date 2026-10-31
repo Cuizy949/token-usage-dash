@@ -1,7 +1,7 @@
-# TokenFrost
+# token-usage-dash
 
-**A frosted-glass token ledger for your AI coding agents.**
-Local-first, offline, zero cloud.
+An always-on-top desktop dashboard for AI coding agents' token usage —
+local-first, offline, zero cloud. Native-macOS-widget look.
 
 macOS 桌面悬浮 AI Token 用量仪表盘：单文件 Swift（NSPanel 无边框置顶，支持
 macOS 26 液态玻璃）+ Python 采集层，统计 Codex / Claude Code / Hermes Agent /
