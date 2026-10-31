@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 
 # 构建产物
+build/
 dash/ai_usage_dash
 *.o
 

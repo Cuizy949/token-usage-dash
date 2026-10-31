@@ -45,13 +45,32 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 
 ## 构建与运行
 
+### 方式一：本地编译 .app（零摩擦，推荐）
+
+自编译产物不带 quarantine 隔离属性，双击即开，Gatekeeper 完全不介入：
+
 ```bash
-xcrun swiftc -O -parse-as-library dash/AiUsageDash.swift -o dash/ai_usage_dash
-./dash/ai_usage_dash                       # 前台运行
-# 常驻：参照 launchd/ai.usagedash.example.plist 配置 launchd
+scripts/build_app.sh               # 本机架构 → build/token-usage-dash.app
+scripts/build_app.sh --universal   # Apple Silicon + Intel 通用二进制
+scripts/build_app.sh --dmg         # 追加打包 DMG（分发用）
 ```
 
-手动验证采集链路（不动 UI）：
+打开 `build/token-usage-dash.app` 即可（常驻菜单栏 + 桌面悬浮卡）。
+要求 Xcode CommandLineTools（`xcrun swiftc`）与 Python 3.10+。
+
+### 方式二：Release DMG（免编译，首次需放行）
+
+浏览器下载的 app 带 quarantine 属性，macOS 14+ 无开发者签名时首次打开流程：
+
+1. 双击 app → 弹窗只有「完成」（被 Gatekeeper 拦截）
+2. **系统设置 → 隐私与安全性** → 底部「已阻止使用…」→ 点**仍要打开**
+3. 再次双击 app → 弹窗出现「打开」→ 确认。此后永久放行
+
+注意：**先拖入 /Applications 再打开**——在 DMG 里直接运行会触发 App
+Translocation（随机只读路径），launchd/菜单等功能可能异常。
+命令行用户的快捷姿势：`xattr -dr com.apple.quarantine /Applications/token-usage-dash.app`
+
+### 方式三：裸跑采集链（不装 APP，纯 CLI）
 
 ```bash
 python3 dash/ai_usage_fetch.py             # 全量六工具 + 三家额度 → JSON
@@ -72,7 +91,14 @@ python3 collectors/ausd_store.py query --month 2026-11        # 月度汇总
 python3 collectors/ausd_store.py query --from 2026-11-01 --to 2026-11-07
 python3 collectors/ausd_store.py rank              # 模型 token 总排行
 python3 collectors/ausd_store.py status            # 覆盖范围
+python3 collectors/ausd_store.py query --month 2026-11 --json # 结构化输出（agent 用）
 ```
+
+`query` / `rank` / `status` 均支持 `--json`：原始整数值的结构化 stdout（与
+日报 CLI `--json` 同一套 agent 友好约定），文本模式仍为人类可读表格。模型名
+写入 store 时即归一（剥尾部 `-NNNN` 日期后缀 + casefold，与 `daily_report`
+同规则）：`GLM-5.3` 与 `glm-5.3` 跨工具同名异写合一，`GLM-5.3` 与
+`GLM-5.3-Flash` 仍是两个模型。
 
 **只向前统计**：store 从首次 `update` 起累积，不回填历史、不依赖任何预置
 基线。写入按「工具 × 日期」整日替换（幂等，任意次重跑结果一致）；各工具

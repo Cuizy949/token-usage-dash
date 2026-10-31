@@ -532,7 +532,10 @@ def main() -> None:
             # 基线按字典序分裂成两天
             date_str = datetime.strptime(args.date, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            raise SystemExit(f"无效日期: {args.date} (应为 YYYY-MM-DD)")
+            # 与 argparse 用法错误同码（文档口径：2 参数错误）；SystemExit(str)
+            # 实际退出码是 1，曾与模块头注释不符
+            print(f"无效日期: {args.date} (应为 YYYY-MM-DD)", file=sys.stderr)
+            raise SystemExit(2)
     else:
         date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 

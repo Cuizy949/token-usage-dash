@@ -18,6 +18,15 @@ SQLite 位置（AIUSD_DATA_DIR 可覆盖）：
     python3 ausd_store.py query --from 2026-11-01 --to 2026-11-07
     python3 ausd_store.py rank [--from D] [--to D]
     python3 ausd_store.py status                 # 各工具覆盖范围
+    python3 ausd_store.py query --month 2026-11 --json   # 结构化 stdout（agent 用）
+
+query/rank/status 均支持 --json：原始整数值的结构化输出到 stdout（供 agent
+调用；文本模式仍是人类可读表格，Swift 菜单/终端共用）。
+
+模型名归一：写入时即按「剥尾部 4 位日期后缀 + casefold」存规范形（规则同
+report/daily_report.py 的 canon_model，防两处漂移）——GLM-5.3 与 glm-5.3 跨
+工具同名异写天然合一；GLM-5.3 与 GLM-5.3-Flash 仍是两个模型。读取端另按
+同规则防御性归组，兼容规范形之前的存量行。
 
 数据源（各采集器同源复用，防漂移）：
     codex     codex_usage.collect_window          （含 ephemeral exec audit 源）
@@ -31,7 +40,9 @@ SQLite 位置（AIUSD_DATA_DIR 可覆盖）：
 import argparse
 import datetime
 import importlib.util
+import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -49,6 +60,61 @@ DB_PATH = os.path.join(DATA_DIR, "stats.sqlite")
 LOCAL_TZ = datetime.datetime.now().astimezone().tzinfo
 
 TOOLS = ("codex", "claude", "hermes", "trae", "zcode", "workbuddy")
+
+# ------------------------------------------------------- 模型名归一 ----
+# 与 report/daily_report.py 的 canon_model 同一规则（单一规则防漂移）：
+# 剥尾部 4 位日期版本后缀（deepseek-v4-flash-0731 → deepseek-v4-flash）再
+# casefold。只归一拼写，不做族合并：GLM-5.3 与 GLM-5.3-Flash 是两个模型。
+# store 落盘即存规范形（确定性小写、无首见依赖），跨工具同名异写天然合一。
+MERGE_RE = re.compile(r"^(.*)-\d{4}$")
+
+
+def canon_model(name: str) -> str:
+    """模型名规范形：剥 -NNNN 后缀 + casefold。"""
+    return MERGE_RE.sub(r"\1", name).casefold()
+
+
+def normalize_models(models: dict) -> dict:
+    """adapter 输出按 canon_model 归一：同规范形模型在同日内合并求和。"""
+    out: dict = {}
+    for m, v in models.items():
+        k = canon_model(m)
+        if k in out:
+            acc = out[k]
+            for f in ("turns", "input", "output", "cache", "total"):
+                acc[f] += v[f]
+        else:
+            out[k] = dict(v)
+    return out
+
+
+def canon_group_rows(rows):
+    """(model, turns, total[, dmin, dmax]) 查询行按 canon key 防御性归组。
+
+    数值求和、日期取 min/max；展示拼写取组内合计最大者（并列取字典序最小，
+    确定性）。写入端已存规范形时每组本就只有一行、函数直通；本归组只为
+    规范形之前的存量行兜底，聚合口径与写入归一恒一致。
+    """
+    groups = {}
+    for r in rows:
+        model, turns, total = str(r[0]), r[1] or 0, r[2] or 0
+        dmin = r[3] if len(r) > 3 else None
+        dmax = r[4] if len(r) > 4 else None
+        g = groups.get(canon_model(model))
+        if g is None:
+            g = groups[canon_model(model)] = {
+                "turns": 0, "total": 0, "dmin": dmin, "dmax": dmax,
+                "best": (total, model)}
+        g["turns"] += turns
+        g["total"] += total
+        if dmin and (g["dmin"] is None or dmin < g["dmin"]):
+            g["dmin"] = dmin
+        if dmax and (g["dmax"] is None or dmax > g["dmax"]):
+            g["dmax"] = dmax
+        if total > g["best"][0] or (total == g["best"][0] and model < g["best"][1]):
+            g["best"] = (total, model)
+    return [(g["best"][1], g["turns"], g["total"], g["dmin"], g["dmax"])
+            for g in groups.values()]
 
 
 # --------------------------------------------------------------- schema ----
@@ -218,7 +284,7 @@ def cmd_update(args):
     conn = open_db()
     tools = args.tool.split(",") if args.tool else list(TOOLS)
     for tool in tools:
-        models = ADAPTERS[tool](target)
+        models = normalize_models(ADAPTERS[tool](target))
         update_date(conn, tool, target, models)
         day_total = sum(v["total"] for v in models.values())
         print(f"{tool:10s} {target}: {len(models)} 模型, 合计 {fmt(day_total)}")
@@ -242,60 +308,102 @@ def cmd_query(args):
     if args.month:
         kv["from"] = args.month + "-01"
         kv["to"] = args.month + "-31"
+        range_info = {"month": args.month, "from": kv["from"], "to": kv["to"]}
+    else:
+        range_info = {"from": args.from_date, "to": args.to_date}
     where, params = _where(kv)
     label = args.month or f"{args.from_date or '最早'} ~ {args.to_date or '最新'}"
-    print(f"=== 分工具合计（{label}，store 封闭日）===")
-    rows = conn.execute(
+
+    tool_rows = conn.execute(
         f"SELECT tool, SUM(turns), SUM(input_tokens), SUM(output_tokens), "
-        f"SUM(total_tokens) FROM usage {where} "
+        f"SUM(cache_tokens), SUM(total_tokens) FROM usage {where} "
         f"GROUP BY tool ORDER BY SUM(total_tokens) DESC", params).fetchall()
+    # 模型维度：canon 防御性归组（写入端已存规范形时直通）
+    model_rows = canon_group_rows(conn.execute(
+        f"SELECT model, SUM(turns), SUM(total_tokens) FROM usage {where} "
+        f"GROUP BY model ORDER BY SUM(total_tokens) DESC", params).fetchall())
+    model_rows.sort(key=lambda r: -r[2])
+    grand = sum(r[5] or 0 for r in tool_rows)
+    conn.close()
+
+    if args.json:
+        print(json.dumps({
+            "range": range_info,
+            "tools": [{"tool": t, "turns": n or 0, "input_tokens": i or 0,
+                       "output_tokens": o or 0, "cache_tokens": c or 0,
+                       "total_tokens": s or 0}
+                      for t, n, i, o, c, s in tool_rows],
+            "grand_total": grand,
+            "models": [{"model": m, "turns": n, "total_tokens": s}
+                       for m, n, s, *_ in model_rows],
+        }, ensure_ascii=False, indent=2))
+        return
+
+    print(f"=== 分工具合计（{label}，store 封闭日）===")
     print(f"{'工具':<10s} {'轮次':>10s} {'输入':>14s} {'输出':>14s} {'合计':>14s}")
-    grand = 0
-    for tool, turns, i, o, t in rows:
-        grand += t or 0
+    for tool, turns, i, o, _c, t in tool_rows:
         print(f"{tool:<10s} {fmt(turns or 0):>10s} {fmt(i or 0):>14s} "
               f"{fmt(o or 0):>14s} {fmt(t or 0):>14s}")
     print(f"{'合计':<10s} {'':>10s} {'':>14s} {'':>14s} {fmt(grand):>14s}")
 
     print(f"\n=== 按模型分布（{label}）===")
-    rows = conn.execute(
-        f"SELECT model, SUM(turns), SUM(total_tokens) FROM usage {where} "
-        f"GROUP BY model ORDER BY SUM(total_tokens) DESC", params).fetchall()
-    if not rows:
+    if not model_rows:
         print("(store 为空：先跑 update)")
-    for model, turns, t in rows:
+    for model, turns, t, *_ in model_rows:
         print(f"  {model}: {fmt(t or 0)}" + (f" / {fmt(turns)} 轮" if turns else ""))
-    conn.close()
 
 
 def cmd_rank(args):
     conn = open_db()
     kv = {"from": args.from_date, "to": args.to_date}
     where, params = _where(kv)
-    rows = conn.execute(
+    rows = canon_group_rows(conn.execute(
         f"SELECT model, SUM(turns), SUM(total_tokens), MIN(date), MAX(date) "
         f"FROM usage {where} GROUP BY model ORDER BY SUM(total_tokens) DESC",
-        params).fetchall()
-    total_all = sum(r[2] or 0 for r in rows) or 1
+        params).fetchall())
+    rows.sort(key=lambda r: -r[2])
+    total_all = sum(r[2] for r in rows)
+    denom = total_all or 1
+    conn.close()
+
+    if args.json:
+        print(json.dumps({
+            "range": {"from": args.from_date, "to": args.to_date},
+            "total_tokens": total_all,
+            "models": [{"rank": n, "model": m, "turns": t, "total_tokens": s,
+                        "share_pct": round(s / denom * 100, 2),
+                        "first_date": dmin, "last_date": dmax}
+                       for n, (m, t, s, dmin, dmax) in enumerate(rows, 1)],
+        }, ensure_ascii=False, indent=2))
+        return
+
     print(f"模型 token 总排行（store {'~'.join(filter(None, [args.from_date, args.to_date])) or '全量'}）")
     print(f"{'#':>3s} {'模型':<36s} {'合计':>12s} {'占比':>8s}  轮次")
     for n, (model, turns, t, dmin, dmax) in enumerate(rows, 1):
-        pct = f"{(t or 0) / total_all * 100:.2f}%"
+        pct = f"{t / denom * 100:.2f}%"
         print(f"{n:>3d} {model:<36s} {fmt(t or 0):>12s} {pct:>8s}  {fmt(turns or 0)}")
-    conn.close()
 
 
 def cmd_status(args):
     conn = open_db()
+    out = []
     for tool in TOOLS:
         row = conn.execute(
             "SELECT COUNT(DISTINCT date), MIN(date), MAX(date), "
             "SUM(total_tokens) FROM usage WHERE tool=?", (tool,)).fetchone()
-        if row[0]:
-            print(f"{tool:10s} {row[0]:4d} 天  {row[1]} ~ {row[2]}  累计 {fmt(row[3] or 0)}")
-        else:
-            print(f"{tool:10s} （store 无数据）")
+        out.append({"tool": tool, "days": row[0] or 0, "first_date": row[1],
+                    "last_date": row[2], "total_tokens": row[3] or 0})
     conn.close()
+
+    if args.json:
+        print(json.dumps({"tools": out}, ensure_ascii=False, indent=2))
+        return
+    for t in out:
+        if t["days"]:
+            print(f"{t['tool']:10s} {t['days']:4d} 天  {t['first_date']} ~ "
+                  f"{t['last_date']}  累计 {fmt(t['total_tokens'])}")
+        else:
+            print(f"{t['tool']:10s} （store 无数据）")
 
 
 def fmt(n):
@@ -320,12 +428,18 @@ def main():
     p.add_argument("--month", help="YYYY-MM")
     p.add_argument("--from", dest="from_date", help="YYYY-MM-DD（含）")
     p.add_argument("--to", dest="to_date", help="YYYY-MM-DD（含）")
+    p.add_argument("--json", action="store_true",
+                   help="结构化 JSON 输出（原始整数值，供 agent 调用）")
 
     p = sub.add_parser("rank", help="模型总排行")
     p.add_argument("--from", dest="from_date")
     p.add_argument("--to", dest="to_date")
+    p.add_argument("--json", action="store_true",
+                   help="结构化 JSON 输出（原始整数值，供 agent 调用）")
 
-    sub.add_parser("status", help="store 覆盖范围")
+    p = sub.add_parser("status", help="store 覆盖范围")
+    p.add_argument("--json", action="store_true",
+                   help="结构化 JSON 输出（原始整数值，供 agent 调用）")
     args = ap.parse_args()
     {"update": cmd_update, "query": cmd_query,
      "rank": cmd_rank, "status": cmd_status}[args.cmd](args)
