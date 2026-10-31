@@ -117,6 +117,79 @@ def main() -> None:
     window_start_utc = window_start.astimezone(timezone.utc)
     window_end_utc = window_end.astimezone(timezone.utc) if window_end else None
 
+    res = collect_window(window_start, window_end, max_files=args.files,
+                         audit_roots=tuple(args.audit_root or ()),
+                         include_audit=not args.no_audit)
+    sums = res["sums"]
+    by_model = res["by_model"]
+    turns = res["turns"]
+    skipped = res["skipped"]
+    audit_runs = res["audit_runs"]
+    latest_rl = res["latest_rl"]
+    latest_rl_any = res["latest_rl_any"]
+
+    n_zst = res["n_zst"]
+    print(f"统计窗口: {label} ({window_start.strftime('%Y-%m-%d %H:%M')} 起)")
+    print(f"API 轮次: {fmt(turns)}")
+    if n_zst:
+        print(f"扫描文件: {res['n_files']} 个（含解压 .zst 归档 {n_zst} 个）")
+    print(f"输入 tokens:      {fmt(sums['input_tokens'])}")
+    print(f"  其中缓存命中:   {fmt(sums['cached_input_tokens'])}")
+    print(f"  其中缓存写入:   {fmt(sums['cache_write_input_tokens'])}")
+    print(f"输出 tokens:      {fmt(sums['output_tokens'])}")
+    print(f"  其中推理:       {fmt(sums['reasoning_output_tokens'])}")
+    print(f"合计 tokens:      {fmt(sums['total_tokens'])}")
+    if skipped:
+        print(f"⚠ {skipped} 行事件解析失败被跳过（疑似新日志格式，请检查）")
+
+    if audit_runs and not args.no_audit:
+        print("\n=== ephemeral exec 批量任务 (audit_logs 来源) ===")
+        for name, n_tasks, total, model in audit_runs:
+            print(f"  {name}: {n_tasks} 任务 | {model} | 窗口内 {fmt(total)}")
+
+
+    print("\n=== 按模型分布 ===")
+    import re as _re
+    _ctl = _re.compile(r"[\x00-\x1f\x7f-\x9f]")
+    if not by_model:
+        print("(无记录)")
+    for model, b in sorted(by_model.items(), key=lambda x: -x[1]["total_tokens"]):
+        print(f"\n模型: {_ctl.sub('', str(model))}")  # SEC-C-03：过滤控制字符
+        print(f"  轮次: {fmt(b['turns'])}")
+        print(f"  输入: {fmt(b['input_tokens'])} (缓存命中 {fmt(b['cached_input_tokens'])}) | 输出: {fmt(b['output_tokens'])} (推理 {fmt(b['reasoning_output_tokens'])})")
+        print(f"  小计: {fmt(b['total_tokens'])}")
+
+    if latest_rl or latest_rl_any:
+        ts, rl = latest_rl or latest_rl_any
+        prim = rl.get("primary") or {}
+        resets = prim.get("resets_at")
+        if resets:
+            reset_local = datetime.fromtimestamp(resets, LOCAL_TZ).strftime("%Y-%m-%d %H:%M") + f" 周{'一二三四五六日'[datetime.fromtimestamp(resets, LOCAL_TZ).weekday()]}"
+        else:
+            reset_local = "?"
+        used = prim.get("used_percent", 0.0)
+        window_min = prim.get("window_minutes", 0)
+        credits = rl.get("credits") or {}
+        print(f"\n=== Codex 主额度 (limit_id=codex, 采样于 {ts.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')}) ===")
+        print(f"窗口: {window_min} 分钟 (= {window_min // 1440} 天)")
+        print(f"本周已用: {used}%")
+        print(f"剩余额度: {round(100 - used, 2)}%")
+        print(f"重置时间: {reset_local}")
+        print(f"附加 credits: has={credits.get('has_credits')} unlimited={credits.get('unlimited')} balance={credits.get('balance')}")
+    else:
+        print("\n未找到 limit_id=codex 的 rate_limits 记录（扫描范围内无主额度数据）")
+
+
+def collect_window(window_start, window_end, max_files=2000,
+                   audit_roots=(), include_audit=True):
+    """聚合 [window_start, window_end) 本地时间窗的 token 数据。
+
+    main() 与 store 适配层（ausd_store.py）共用的唯一实现——防漂移。
+    返回 dict: sums/by_model/turns/skipped/audit_runs/latest_rl/latest_rl_any。
+    """
+    window_start_utc = window_start.astimezone(timezone.utc)
+    window_end_utc = window_end.astimezone(timezone.utc) if window_end else None
+
     # 2026-09-16 修复（M1 先截断后过滤）：原实现先按 mtime 取 [:args.files]
     # 再在循环里跳过窗前的旧文件——查历史日期时，当窗文件恰是 mtime 最旧
     # 的一批，会被截断静默丢弃（archived_sessions 已 539+ 个且持续增长）。
@@ -134,7 +207,7 @@ def main() -> None:
         if os.path.getmtime(f) >= _cutoff),
         key=os.path.getmtime,
         reverse=True,
-    )[: args.files]
+    )[:max_files]
 
     sums = {k: 0 for k in TOKEN_KEYS}
     skipped = 0
@@ -147,7 +220,7 @@ def main() -> None:
     # ---- Source 2: ephemeral codex exec batch runs (workflow audit logs) ----
     # 共享实现 codex_audit_scanner.py（model_usage_rank / usage_archive_backfill
     # 同源，防漂移）。仅 ephemeral=true 的 run；非 ephemeral 会写 sessions/。
-    if not args.no_audit:
+    if include_audit:
         _scanner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "codex_audit_scanner.py")
         _spec = importlib.util.spec_from_file_location("codex_audit_scanner", _scanner)
@@ -159,7 +232,7 @@ def main() -> None:
             _win_end = window_end if window_end.tzinfo else window_end.replace(tzinfo=LOCAL_TZ)
         for rec in _cas.scan_audit_runs(window_start=_win_start, window_end=_win_end,
                                         local_tz=LOCAL_TZ,
-                                        extra_roots=args.audit_root or ()):
+                                        extra_roots=audit_roots):
             u = rec["usage"]
             bucket = by_model.setdefault(
                 rec["model"], {"turns": 0, **{k: 0 for k in TOKEN_KEYS}}
@@ -258,56 +331,12 @@ def main() -> None:
                 if latest_rl_any is None or ts > latest_rl_any[0]:
                     latest_rl_any = (ts, rl)
 
-    n_zst = sum(1 for f in files if f.endswith(".zst"))
-    print(f"统计窗口: {label} ({window_start.strftime('%Y-%m-%d %H:%M')} 起)")
-    print(f"API 轮次: {fmt(turns)}")
-    if n_zst:
-        print(f"扫描文件: {len(files)} 个（含解压 .zst 归档 {n_zst} 个）")
-    print(f"输入 tokens:      {fmt(sums['input_tokens'])}")
-    print(f"  其中缓存命中:   {fmt(sums['cached_input_tokens'])}")
-    print(f"  其中缓存写入:   {fmt(sums['cache_write_input_tokens'])}")
-    print(f"输出 tokens:      {fmt(sums['output_tokens'])}")
-    print(f"  其中推理:       {fmt(sums['reasoning_output_tokens'])}")
-    print(f"合计 tokens:      {fmt(sums['total_tokens'])}")
-    if skipped:
-        print(f"⚠ {skipped} 行事件解析失败被跳过（疑似新日志格式，请检查）")
+    return {"sums": sums, "by_model": by_model, "turns": turns,
+            "skipped": skipped, "audit_runs": audit_runs,
+            "latest_rl": latest_rl, "latest_rl_any": latest_rl_any,
+            "n_files": len(files),
+            "n_zst": sum(1 for f in files if f.endswith(".zst"))}
 
-    if audit_runs and not args.no_audit:
-        print("\n=== ephemeral exec 批量任务 (audit_logs 来源) ===")
-        for name, n_tasks, total, model in audit_runs:
-            print(f"  {name}: {n_tasks} 任务 | {model} | 窗口内 {fmt(total)}")
-
-
-    print("\n=== 按模型分布 ===")
-    import re as _re
-    _ctl = _re.compile(r"[\x00-\x1f\x7f-\x9f]")
-    if not by_model:
-        print("(无记录)")
-    for model, b in sorted(by_model.items(), key=lambda x: -x[1]["total_tokens"]):
-        print(f"\n模型: {_ctl.sub('', str(model))}")  # SEC-C-03：过滤控制字符
-        print(f"  轮次: {fmt(b['turns'])}")
-        print(f"  输入: {fmt(b['input_tokens'])} (缓存命中 {fmt(b['cached_input_tokens'])}) | 输出: {fmt(b['output_tokens'])} (推理 {fmt(b['reasoning_output_tokens'])})")
-        print(f"  小计: {fmt(b['total_tokens'])}")
-
-    if latest_rl or latest_rl_any:
-        ts, rl = latest_rl or latest_rl_any
-        prim = rl.get("primary") or {}
-        resets = prim.get("resets_at")
-        if resets:
-            reset_local = datetime.fromtimestamp(resets, LOCAL_TZ).strftime("%Y-%m-%d %H:%M") + f" 周{'一二三四五六日'[datetime.fromtimestamp(resets, LOCAL_TZ).weekday()]}"
-        else:
-            reset_local = "?"
-        used = prim.get("used_percent", 0.0)
-        window_min = prim.get("window_minutes", 0)
-        credits = rl.get("credits") or {}
-        print(f"\n=== Codex 主额度 (limit_id=codex, 采样于 {ts.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')}) ===")
-        print(f"窗口: {window_min} 分钟 (= {window_min // 1440} 天)")
-        print(f"本周已用: {used}%")
-        print(f"剩余额度: {round(100 - used, 2)}%")
-        print(f"重置时间: {reset_local}")
-        print(f"附加 credits: has={credits.get('has_credits')} unlimited={credits.get('unlimited')} balance={credits.get('balance')}")
-    else:
-        print("\n未找到 limit_id=codex 的 rate_limits 记录（扫描范围内无主额度数据）")
 
 
 if __name__ == "__main__":

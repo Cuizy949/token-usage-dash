@@ -54,6 +54,44 @@ def main() -> None:
     window_start_utc = window_start.astimezone(timezone.utc)
     window_end_utc = window_end.astimezone(timezone.utc) if window_end else None
 
+    res = collect_window(window_start, window_end, max_files=args.files)
+    sums = res["sums"]
+    by_model = res["by_model"]
+    turns = res["turns"]
+
+    total = sum(sums.values())
+    print(f"统计窗口: {label} ({window_start.strftime('%Y-%m-%d %H:%M')} 起)")
+    print(f"助手轮次 (去重后): {fmt(turns)}")
+    print(f"输入 tokens:      {fmt(sums['input_tokens'])}")
+    print(f"缓存创建 tokens:  {fmt(sums['cache_creation_input_tokens'])}")
+    print(f"缓存读取 tokens:  {fmt(sums['cache_read_input_tokens'])}")
+    print(f"输出 tokens:      {fmt(sums['output_tokens'])}")
+    print(f"合计 tokens:      {fmt(total)}")
+
+    print("\n=== 按模型分布 ===")
+    if not by_model:
+        print("(无记录)")
+    for model, b in sorted(
+        by_model.items(),
+        key=lambda x: -(x[1]["input_tokens"] + x[1]["cache_creation_input_tokens"]
+                        + x[1]["cache_read_input_tokens"] + x[1]["output_tokens"]),
+    ):
+        btotal = sum(b[k] for k in TOKEN_KEYS)
+        print(f"\n模型: {model}")
+        print(f"  轮次: {fmt(b['turns'])}")
+        print(f"  输入: {fmt(b['input_tokens'])} | 缓存创建: {fmt(b['cache_creation_input_tokens'])} | 缓存读取: {fmt(b['cache_read_input_tokens'])} | 输出: {fmt(b['output_tokens'])}")
+        print(f"  小计: {fmt(btotal)}")
+
+
+def collect_window(window_start, window_end, max_files=300):
+    """聚合 [window_start, window_end) 本地时间窗的 token 数据。
+
+    main() 与 store 适配层（ausd_store.py）共用的唯一实现——防漂移。
+    返回 dict: sums/by_model/turns。
+    """
+    window_start_utc = window_start.astimezone(timezone.utc)
+    window_end_utc = window_end.astimezone(timezone.utc) if window_end else None
+
     # 2026-09-16 修复（M1 先截断后过滤，同 codex_usage.py）：先按 cutoff
     # 过滤再排序截断，防查历史日期时当窗文件被 [:args.files] 静默丢弃。
     _cutoff = window_start.timestamp() - 86400
@@ -62,7 +100,7 @@ def main() -> None:
          if os.path.getmtime(f) >= _cutoff),
         key=os.path.getmtime,
         reverse=True,
-    )[: args.files]
+    )[:max_files]
 
     sums = {k: 0 for k in TOKEN_KEYS}
     by_model = {}  # model -> {"turns": int, **{k: int}}
@@ -112,28 +150,8 @@ def main() -> None:
                     sums[k] += v
                     bucket[k] += v
 
-    total = sum(sums.values())
-    print(f"统计窗口: {label} ({window_start.strftime('%Y-%m-%d %H:%M')} 起)")
-    print(f"助手轮次 (去重后): {fmt(turns)}")
-    print(f"输入 tokens:      {fmt(sums['input_tokens'])}")
-    print(f"缓存创建 tokens:  {fmt(sums['cache_creation_input_tokens'])}")
-    print(f"缓存读取 tokens:  {fmt(sums['cache_read_input_tokens'])}")
-    print(f"输出 tokens:      {fmt(sums['output_tokens'])}")
-    print(f"合计 tokens:      {fmt(total)}")
+    return {"sums": sums, "by_model": by_model, "turns": turns}
 
-    print("\n=== 按模型分布 ===")
-    if not by_model:
-        print("(无记录)")
-    for model, b in sorted(
-        by_model.items(),
-        key=lambda x: -(x[1]["input_tokens"] + x[1]["cache_creation_input_tokens"]
-                        + x[1]["cache_read_input_tokens"] + x[1]["output_tokens"]),
-    ):
-        btotal = sum(b[k] for k in TOKEN_KEYS)
-        print(f"\n模型: {model}")
-        print(f"  轮次: {fmt(b['turns'])}")
-        print(f"  输入: {fmt(b['input_tokens'])} | 缓存创建: {fmt(b['cache_creation_input_tokens'])} | 缓存读取: {fmt(b['cache_read_input_tokens'])} | 输出: {fmt(b['output_tokens'])}")
-        print(f"  小计: {fmt(btotal)}")
 
 
 if __name__ == "__main__":

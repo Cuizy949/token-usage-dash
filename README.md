@@ -11,6 +11,7 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 ├─ dash/ai_usage_fetch.py ── 数据桥（全量/单工具/仅额度三种模式）
 │        │ import
 ├─ collectors/              ── 采集层（全部本地只读，额度探针除外）
+│   ├─ ausd_store.py        · 本地统计 store：日报/月度/任意区间/模型总排行统一事实源
 │   ├─ keydash_push.py      · 采集总入口 + 小屏渲染/推送（cron 可独立运行）
 │   ├─ ai_usage_summary.py  · 六工具日汇总（子进程调度各底层采集器）
 │   ├─ codex_usage.py / cc_usage.py / hermes_usage.py / zcode_usage.py
@@ -53,6 +54,29 @@ python3 dash/ai_usage_fetch.py             # 全量六工具 + 三家额度 → 
 python3 dash/ai_usage_fetch.py --tool codex     # 单工具（事件驱动用）
 python3 collectors/keydash_push.py         # 渲染 142×428 卡片图 → /tmp/keydash_push.jpg
 ```
+
+## 统计 store（日报 / 月度 / 任意区间 / 模型总排行）
+
+`collectors/ausd_store.py` 维护一个本地 SQLite（默认
+`~/Library/Application Support/AiUsageDash/stats.sqlite`，`AIUSD_DATA_DIR`
+可覆盖），是四种汇总查询的统一事实源：
+
+```bash
+python3 collectors/ausd_store.py update            # 每日跑一次（默认统计昨日）
+python3 collectors/ausd_store.py update --tool codex,claude   # 单工具补跑
+python3 collectors/ausd_store.py query --month 2026-11        # 月度汇总
+python3 collectors/ausd_store.py query --from 2026-11-01 --to 2026-11-07
+python3 collectors/ausd_store.py rank              # 模型 token 总排行
+python3 collectors/ausd_store.py status            # 覆盖范围
+```
+
+**只向前统计**：store 从首次 `update` 起累积，不回填历史、不依赖任何预置
+基线。写入按「工具 × 日期」整日替换（幂等，任意次重跑结果一致）；各工具
+数据一律出自 collectors 内与其命令行完全相同的实现（`codex_usage.
+collect_window` 等），store 日合计与采集器文本出口逐 token 一致（部署时
+已交叉验证）。今日永远实时解析、不入 store，与悬浮卡不双计。
+
+建议把 `update` 挂成每日 cron（如 00:30），连续性即自动维持。
 
 ## 配置（环境变量）
 
