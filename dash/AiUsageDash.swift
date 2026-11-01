@@ -140,6 +140,14 @@ enum BundleLayout {
         return firstExisting([execDir + "/../assets/icons",
                               execDir + "/../Resources/assets/icons"])
     }
+    /// 内嵌 Python 运行时（python-build-standalone，自包含 bundle 用）；
+    /// 仓库裸跑没有 runtime → 返回 /usr/bin/env shim（走 PATH 里的 python3）。
+    /// 环境变量 AIUSD_PYTHON 仍最高优先（见 DataFetcher.venvPython）。
+    static var pythonBin: String {
+        firstExisting([execDir + "/../Resources/python-runtime/bin/python3",
+                       execDir + "/../python-runtime/bin/python3",
+                       "/usr/bin/env"])
+    }
 }
 
 // MARK: - 数据采集（复用 keydash 采集脚本，后台线程执行）
@@ -147,14 +155,15 @@ enum BundleLayout {
 final class DataFetcher {
     static let shared = DataFetcher()
 
-    // 解析器与采集脚本：默认相对本二进制定位（仓库布局 dash/../collectors），
-    // 可用环境变量覆盖（AIUSD_PYTHON / AIUSD_FETCH_SCRIPT）
+    // 解析器：env AIUSD_PYTHON 最高优先 → bundle 内嵌 runtime → /usr/bin/env shim。
+    // 脚本/图标定位统一走 BundleLayout（仓库裸跑与 .app 双布局）。
     var venvPython: String {
-        let env = ProcessInfo.processInfo.environment
-        return env["AIUSD_PYTHON"] ?? "/usr/bin/env"
+        if let p = ProcessInfo.processInfo.environment["AIUSD_PYTHON"] { return p }
+        return BundleLayout.pythonBin
     }
     var usesEnvShim: Bool {
         ProcessInfo.processInfo.environment["AIUSD_PYTHON"] == nil
+            && BundleLayout.pythonBin == "/usr/bin/env"
     }
     // ReportRunner 复用同一解释器解析
     var pythonPath: String { venvPython }

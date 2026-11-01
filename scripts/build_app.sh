@@ -54,6 +54,19 @@ cp "$REPO"/collectors/*.py           "$APP/Contents/Resources/collectors/"
 cp "$REPO"/assets/icons/*.png        "$APP/Contents/Resources/assets/icons/"
 find "$APP" -name "*.py" -exec chmod 644 {} +
 
+# ---- 内嵌 Python 运行时（自包含；--universal 轨除外——universal 版走系统 python3）----
+# python-build-standalone 可重定位发行版 + pycryptodome，见 embed_python.sh。
+# Swift 侧 BundleLayout.pythonBin 探测 Resources/python-runtime/bin/python3。
+if [[ "$UNIVERSAL" != 1 ]]; then
+  if [[ ! -x "$REPO/build/python-runtime/bin/python3" ]]; then
+    bash "$REPO/scripts/embed_python.sh"
+  fi
+  cp -R "$REPO/build/python-runtime" "$APP/Contents/Resources/python-runtime"
+  rm -f "$APP/Contents/Resources/python-runtime/.stamp"
+  find "$APP/Contents/Resources/python-runtime" -name __pycache__ -type d \
+    -exec rm -rf {} + 2>/dev/null || true
+fi
+
 # ---- Info.plist（LSUIElement：无 Dock 图标，与 setActivationPolicy(.accessory) 一致）----
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -103,4 +116,7 @@ if [[ "$DMG" == 1 ]]; then
   rm -f "$DMG"
   hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
   echo "✓ $DMG  （浏览器下载会带 quarantine：需拖入 /Applications 后按 README 流程放行）"
+fi
+if [[ "$UNIVERSAL" == 1 ]]; then
+  echo "ℹ️ universal 版不含内嵌 Python，运行依赖系统 python3（见 README）"
 fi

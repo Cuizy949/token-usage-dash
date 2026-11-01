@@ -34,14 +34,15 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 
 ## 环境要求
 
-- macOS 14+（液态玻璃模式需 macOS 26+ SDK 编译、26+ 运行）
-- Python 3.10+（核心采集层标准库即可，可选依赖见下）
-- Xcode CommandLineTools（`xcrun swiftc`）
+- macOS 14+ arm64（液态玻璃模式需 macOS 26+ SDK 编译、26+ 运行）
+- **app 版零依赖**：bundle 内嵌 Python 3.12 运行时 + pycryptodome（Trae 3.4.x
+  解密开箱即用），无需另装任何环境
+- 自编译需 Xcode CommandLineTools（`xcrun swiftc`，首次构建自动下载内嵌运行时）
 - 各 AI 工具已在本机使用过（数据源均为各工具本地日志/数据库的**只读**访问）：
   `~/.codex`、`~/.claude`、`~/.workbuddy`、`~/.zcode`、Trae Application Support、
   Hermes `~/.hermes/logs`（可经 `HERMES_HOME` 重定向）
-- 可选：`Pillow`（小屏卡片渲染）、`pycryptodome`（Trae 3.4.x 加密库解密）、
-  `zstd`（Codex `.jsonl.zst` 归档会话解压）、Google Chrome（趋势图 PNG 渲染）
+- 可选（app 内已含 pycryptodome）：`zstd`（Codex `.jsonl.zst` 归档解压，缺则跳过该源）、
+  `Pillow`（裸 CLI 小屏渲染）、Google Chrome（趋势图 PNG 渲染）
 
 ## 构建与运行
 
