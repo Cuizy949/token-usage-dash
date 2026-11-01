@@ -1207,7 +1207,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         depLabel = NSTextField(labelWithString: "探测中…")
         depLabel.font = NSFont.systemFont(ofSize: 11)
         depLabel.textColor = .secondaryLabelColor
-        depLabel.frame = NSRect(x: 14, y: y - 46, width: view.frame.width - 28, height: 60)
+        depLabel.lineBreakMode = .byWordWrapping
+        // 紧贴「依赖状态」标题下方（标题占 y-4~y+14），两行文本，不与标题重叠
+        depLabel.frame = NSRect(x: 14, y: y - 44, width: view.frame.width - 28, height: 36)
         view.addSubview(depLabel)
         let hint = NSTextField(labelWithString: "更改立即生效；Trae 3.4.x 解密依赖已内嵌于 app。")
         hint.font = NSFont.systemFont(ofSize: 10)
