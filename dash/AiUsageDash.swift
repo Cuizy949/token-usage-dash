@@ -1,5 +1,7 @@
 import Cocoa
 import CoreServices
+import ServiceManagement
+import Network
 
 // MARK: - 数据模型（对应 ai_usage_fetch.py 的 JSON）
 
@@ -216,6 +218,8 @@ final class DataFetcher {
         // 禁止子进程写 .pyc：避免运行时在 bundle Resources/ 里生成 __pycache__
         var childEnv = ProcessInfo.processInfo.environment
         childEnv["PYTHONDONTWRITEBYTECODE"] = "1"
+        // GUI 设置（设置窗口显式配置项）优先于继承的 shell 环境
+        for (k, v) in SettingsStore.envOverrides() { childEnv[k] = v }
         proc.environment = childEnv
 
         let outPipe = Pipe()
@@ -994,6 +998,346 @@ extension NSWindow.Level {
     }
 }
 
+// MARK: - 设置存储与 env 桥（GUI 配置 → 子进程环境变量）
+//
+// 语义：GUI 未配置（空）= 不注入 = Python 层默认行为，与 CLI/launchd 用户完全
+// 一致；显式配置才覆盖（含覆盖继承的 shell 环境）。Python 采集层零改动。
+enum SettingsStore {
+    struct Field {
+        let key: String          // UserDefaults 键
+        let env: String          // 注入的子进程环境变量
+        let label: String
+        let placeholder: String
+    }
+    /// 核心项（推送与归档）+ 高级项；顺序即设置窗口展示顺序
+    static let pushFields: [Field] = [
+        Field(key: "settings.deviceHost",  env: "AIUSD_DEVICE_HOST", label: "小屏设备 IP",
+              placeholder: "如 192.168.1.50，留空不推送"),
+        Field(key: "settings.nasVolume",   env: "AIUSD_NAS_VOLUME",  label: "NAS 挂载点",
+              placeholder: "如 /Volumes/nas，留空跳过月归档"),
+        Field(key: "settings.nasMountUrl", env: "AIUSD_NAS_MOUNT_URL", label: "NAS WebDAV URL",
+              placeholder: "卷掉线时自动重挂，可留空"),
+    ]
+    static let advancedFields: [Field] = [
+        Field(key: "settings.codexBin",        env: "AIUSD_CODEX_BIN",      label: "Codex CLI 路径",
+              placeholder: "默认 PATH 上的 codex"),
+        Field(key: "settings.codexAuditRoots", env: "AIUSD_CODEX_AUDIT_ROOTS", label: "audit 扫描根",
+              placeholder: "冒号分隔 glob，默认不扫"),
+        Field(key: "settings.hermesHome",      env: "HERMES_HOME",          label: "Hermes 数据目录",
+              placeholder: "默认 ~/.hermes"),
+        Field(key: "settings.stateDir",        env: "AIUSD_STATE_DIR",      label: "状态目录",
+              placeholder: "默认 ~/.cache/ai_usage_dash"),
+        Field(key: "settings.dataDir",         env: "AIUSD_DATA_DIR",       label: "统计 store 目录",
+              placeholder: "默认 ~/Library/Application Support/AiUsageDash"),
+    ]
+    static func value(for key: String) -> String {
+        UserDefaults.standard.string(forKey: key) ?? ""
+    }
+    static func envOverrides() -> [String: String] {
+        var out: [String: String] = [:]
+        for f in pushFields + advancedFields {
+            let v = value(for: f.key).trimmingCharacters(in: .whitespaces)
+            if !v.isEmpty { out[f.env] = v }
+        }
+        return out
+    }
+}
+
+// MARK: - 依赖探测（设置窗口「依赖状态」区：pycryptodome / zstd）
+enum DependencyProbe {
+    /// 当前解释器（env AIUSD_PYTHON → 内嵌 runtime → PATH python3）能否 import Crypto
+    static func probeCrypto(completion: @escaping (Bool) -> Void) {
+        let f = DataFetcher.shared
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: f.venvPython)
+        proc.arguments = f.usesEnvShim ? ["python3", "-c", "import Crypto"] : ["-c", "import Crypto"]
+        proc.standardOutput = Pipe()   // 静默
+        proc.standardError = Pipe()
+        DispatchQueue.global(qos: .utility).async {
+            let ok: Bool
+            if (try? proc.run()) != nil {
+                let timer = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 8, execute: timer)
+                proc.waitUntilExit()
+                timer.cancel()
+                ok = proc.terminationStatus == 0
+            } else {
+                ok = false
+            }
+            DispatchQueue.main.async { completion(ok) }
+        }
+    }
+    /// zstd CLI（codex_usage.py 同款探测：which → Homebrew 兜底）
+    static func zstdPath() -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = ["which", "zstd"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        guard (try? proc.run()) != nil else { return nil }
+        proc.waitUntilExit()
+        if proc.terminationStatus == 0,
+           let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+               .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            return s
+        }
+        for c in ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"]
+        where FileManager.default.fileExists(atPath: c) { return c }
+        return nil
+    }
+    /// TCP 预检（与 keydash 推送前预检同语义：目标 80 端口毫秒级可达性）
+    static func tcpProbe(host: String, timeout: TimeInterval = 3,
+                         completion: @escaping (Bool) -> Void) {
+        guard let port = NWEndpoint.Port(rawValue: 80) else { completion(false); return }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
+        var done = false
+        let finish: (Bool) -> Void = { ok in
+            guard !done else { return }
+            done = true
+            conn.cancel()
+            DispatchQueue.main.async { completion(ok) }
+        }
+        conn.stateUpdateHandler = { st in
+            switch st {
+            case .ready: finish(true)
+            case .failed, .cancelled: finish(false)
+            default: break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+    }
+}
+
+// MARK: - 设置窗口（通用 / 推送与归档 / 高级）
+final class SettingsWindowController: NSObject, NSTextFieldDelegate {
+    static let shared = SettingsWindowController()
+    private var window: NSWindow?
+    private var loginCheck: NSButton!
+    private var loginStatus: NSTextField!
+    private var freqPopup: NSPopUpButton!
+    private var depLabel: NSTextField!
+    private var probeResult: NSTextField!
+    private var fields: [String: NSTextField] = [:]   // settings key → 输入框
+
+    func show() {
+        if window == nil { buildWindow() }
+        syncStates()
+        NSApp.activate(ignoringOtherApps: true)   // accessory app：显式抢一次焦点
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: 布局
+
+    private func buildWindow() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 470),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "设置"
+        w.isReleasedWhenClosed = false
+        w.center()
+        let tabs = NSTabView(frame: NSRect(x: 12, y: 46, width: 516, height: 410))
+        tabs.addTabViewItem(makeGeneralTab(size: tabs.frame.size))
+        tabs.addTabViewItem(makePushTab(size: tabs.frame.size))
+        tabs.addTabViewItem(makeAdvancedTab(size: tabs.frame.size))
+        w.contentView?.addSubview(tabs)
+        window = w
+    }
+
+    private func makeTabItem(_ label: String, size: NSSize) -> (NSTabViewItem, NSView) {
+        let item = NSTabViewItem(identifier: nil)
+        item.label = label
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: size.width, height: size.height - 28))
+        item.view = view
+        return (item, view)
+    }
+
+    /// 一行「标签 + 控件」，y 自上而下递减；返回下一个 y
+    @discardableResult
+    private func addRow(_ y: CGFloat, label: String, control: NSControl?,
+                        view: NSView, width: CGFloat = 320) -> CGFloat {
+        let l = NSTextField(labelWithString: label)
+        l.frame = NSRect(x: 14, y: y - 3, width: 130, height: 20)
+        l.alignment = .right
+        view.addSubview(l)
+        if let c = control {
+            c.frame = NSRect(x: 152, y: y, width: width, height: 22)
+            view.addSubview(c)
+        }
+        return y - 34
+    }
+
+    private func textField(key: String, placeholder: String) -> NSTextField {
+        let f = NSTextField()
+        f.identifier = NSUserInterfaceItemIdentifier(key)
+        f.placeholderString = placeholder
+        f.stringValue = SettingsStore.value(for: key)
+        f.delegate = self
+        fields[key] = f
+        return f
+    }
+
+    private func makeGeneralTab(size: NSSize) -> NSTabViewItem {
+        let (item, view) = makeTabItem("通用", size: size)
+        var y: CGFloat = view.frame.height - 40
+        // 开机自启（SMAppService 登录项；app 移动位置后旧注册失效，重新勾选即可）
+        let check = NSButton(checkboxWithTitle: "登录时自动启动", target: self,
+                             action: #selector(toggleLoginItem))
+        y = addRow(y, label: "常驻", control: check, view: view, width: 200)
+        loginCheck = check
+        loginStatus = NSTextField(labelWithString: "")
+        loginStatus.font = NSFont.systemFont(ofSize: 11)
+        loginStatus.textColor = .secondaryLabelColor
+        loginStatus.frame = NSRect(x: 158, y: y + 12, width: 340, height: 16)
+        view.addSubview(loginStatus)
+        y -= 14
+        // 刷新频率（与菜单共用 refreshIntervalMin 键，双向一致）
+        let popup = NSPopUpButton()
+        for m in AiUsageDashApp.refreshIntervalChoices { popup.addItem(withTitle: "\(m) 分钟") }
+        popup.target = self
+        popup.action = #selector(freqChanged)
+        y = addRow(y, label: "刷新频率", control: popup, view: view, width: 120)
+        freqPopup = popup
+        // 依赖状态（打开窗口时后台探测）
+        y -= 10
+        let depTitle = NSTextField(labelWithString: "依赖状态")
+        depTitle.font = NSFont.boldSystemFont(ofSize: 12)
+        depTitle.frame = NSRect(x: 14, y: y - 4, width: 200, height: 18)
+        view.addSubview(depTitle)
+        depLabel = NSTextField(labelWithString: "探测中…")
+        depLabel.font = NSFont.systemFont(ofSize: 11)
+        depLabel.textColor = .secondaryLabelColor
+        depLabel.frame = NSRect(x: 14, y: y - 46, width: view.frame.width - 28, height: 60)
+        view.addSubview(depLabel)
+        let hint = NSTextField(labelWithString: "更改立即生效；Trae 3.4.x 解密依赖已内嵌于 app。")
+        hint.font = NSFont.systemFont(ofSize: 10)
+        hint.textColor = .tertiaryLabelColor
+        hint.frame = NSRect(x: 14, y: 8, width: 480, height: 14)
+        view.addSubview(hint)
+        return item
+    }
+
+    private func makePushTab(size: NSSize) -> NSTabViewItem {
+        let (item, view) = makeTabItem("推送与归档", size: size)
+        var y: CGFloat = view.frame.height - 40
+        var hostField: NSTextField?
+        for f in SettingsStore.pushFields {
+            let tf = textField(key: f.key, placeholder: f.placeholder)
+            y = addRow(y, label: f.label, control: tf, view: view)
+            if f.key == "settings.deviceHost" { hostField = tf }
+        }
+        let probe = NSButton(title: "测试连接", target: self, action: #selector(probeDevice))
+        probe.bezelStyle = .rounded
+        probe.frame = NSRect(x: 152, y: y + 6, width: 90, height: 24)
+        view.addSubview(probe)
+        probeResult = NSTextField(labelWithString: "")
+        probeResult.font = NSFont.systemFont(ofSize: 11)
+        probeResult.textColor = .secondaryLabelColor
+        probeResult.frame = NSRect(x: 252, y: y + 10, width: 260, height: 18)
+        view.addSubview(probeResult)
+        _ = hostField
+        return item
+    }
+
+    private func makeAdvancedTab(size: NSSize) -> NSTabViewItem {
+        let (item, view) = makeTabItem("高级", size: size)
+        var y: CGFloat = view.frame.height - 40
+        for f in SettingsStore.advancedFields {
+            let tf = textField(key: f.key, placeholder: f.placeholder)
+            y = addRow(y, label: f.label, control: tf, view: view, width: 330)
+        }
+        let hint = NSTextField(labelWithString: "一般无需修改；留空即默认值，与 CLI 环境变量同名同义。")
+        hint.font = NSFont.systemFont(ofSize: 10)
+        hint.textColor = .tertiaryLabelColor
+        hint.frame = NSRect(x: 14, y: y - 2, width: 480, height: 14)
+        view.addSubview(hint)
+        return item
+    }
+
+    // MARK: 状态同步与动作
+
+    private func syncStates() {
+        // 登录项
+        let status = SMAppService.mainApp.status
+        switch status {
+        case .enabled:
+            loginStatus.stringValue = "已启用"
+            loginStatus.textColor = .systemGreen
+        case .requiresApproval:
+            loginStatus.stringValue = "待批准：请到 系统设置 → 通用 → 登录项 中允许"
+            loginStatus.textColor = .systemOrange
+        default:
+            loginStatus.stringValue = "未启用"
+            loginStatus.textColor = .secondaryLabelColor
+        }
+        loginCheck.state = (status == .enabled) ? .on : .off
+        // 刷新频率
+        let cur = AiUsageDashApp.refreshIntervalMin
+        if let idx = AiUsageDashApp.refreshIntervalChoices.firstIndex(of: cur) {
+            freqPopup.selectItem(at: idx)
+        }
+        // 依赖探测（后台）
+        depLabel.stringValue = "探测中…"
+        DependencyProbe.probeCrypto { crypto in
+            let zstd = DependencyProbe.zstdPath()
+            self.depLabel.stringValue =
+                "pycryptodome（Trae 解密）：\(crypto ? "✓ 可用" : "✗ 缺失（Trae 3.4.x 无法统计）")\n" +
+                "zstd（Codex 归档解压）：\(zstd ?? "未安装（跳过 .jsonl.zst 归档源）")"
+        }
+    }
+
+    @objc private func toggleLoginItem() {
+        do {
+            if loginCheck.state == .on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            loginCheck.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+            loginStatus.stringValue = "注册失败：\(error.localizedDescription)"
+            loginStatus.textColor = .systemRed
+            return
+        }
+        syncStates()
+    }
+
+    @objc private func freqChanged() {
+        let idx = freqPopup.indexOfSelectedItem
+        guard AiUsageDashApp.refreshIntervalChoices.indices.contains(idx) else { return }
+        AiUsageDashApp.setRefreshInterval(AiUsageDashApp.refreshIntervalChoices[idx])   // 持久化+重建定时器+立即刷新
+    }
+
+    @objc private func probeDevice() {
+        guard let f = fields["settings.deviceHost"] else { return }
+        let host = f.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else {
+            probeResult.stringValue = "请先填写设备 IP"
+            probeResult.textColor = .secondaryLabelColor
+            return
+        }
+        probeResult.stringValue = "连接中…"
+        probeResult.textColor = .secondaryLabelColor
+        DependencyProbe.tcpProbe(host: host) { ok in
+            self.probeResult.stringValue = ok ? "✓ 可达（80 端口）" : "✗ 不可达"
+            self.probeResult.textColor = ok ? .systemGreen : .systemRed
+        }
+    }
+
+    // MARK: NSTextFieldDelegate（失焦即存；空串移除键 = 恢复默认）
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let tf = obj.object as? NSTextField,
+              let key = tf.identifier?.rawValue else { return }
+        let v = tf.stringValue.trimmingCharacters(in: .whitespaces)
+        if v.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else {
+            UserDefaults.standard.set(v, forKey: key)
+        }
+    }
+}
+
 final class DashMenuController: NSObject, NSMenuDelegate {
     static let shared = DashMenuController()
 
@@ -1080,6 +1424,9 @@ final class DashMenuController: NSObject, NSMenuDelegate {
         menu.addItem(cardsTitle)
         menu.addItem(freqTitle)
         menu.addItem(reportTitle)         // 统计报表（index 8）
+        let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = c
+        menu.addItem(settingsItem)        // 设置（index 9；menuNeedsUpdate 只引用 1-7）
         menu.addItem(.separator())
         menu.addItem(quitItem)
         return menu
@@ -1156,6 +1503,7 @@ final class DashMenuController: NSObject, NSMenuDelegate {
         AiUsageDashApp.toggleCardVisibility(key)
     }
     @objc func quit() { NSApp.terminate(nil) }
+    @objc func openSettings() { SettingsWindowController.shared.show() }
 
     // ---- 统计报表（本地 store / 日报脚本，后台执行，文本窗口呈现）----
     @objc func reportDaily() {
@@ -1248,6 +1596,7 @@ final class ReportWindowController {
                 : [scriptPath] + args
             var childEnv = ProcessInfo.processInfo.environment
             childEnv["PYTHONDONTWRITEBYTECODE"] = "1"
+            for (k, v) in SettingsStore.envOverrides() { childEnv[k] = v }
             proc.environment = childEnv
             let outPipe = Pipe(), errPipe = Pipe()
             proc.standardOutput = outPipe
