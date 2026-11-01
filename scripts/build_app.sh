@@ -2,9 +2,12 @@
 # 构建 token-usage-dash.app（自包含 .app bundle，含 Python 采集层与图标资源）
 #
 # 用法：
-#   scripts/build_app.sh               # 本机架构
-#   scripts/build_app.sh --universal   # arm64 + x86_64 通用二进制
-#   scripts/build_app.sh --dmg         # 追加打包 DMG（用于 Release 分发）
+#   scripts/build_app.sh               # 本机架构（arm64 自包含，内嵌 Python）
+#   scripts/build_app.sh --dmg         # 追加打包 DMG
+#   scripts/build_app.sh --universal   # arm64 + x86_64（走系统 python3，不含内嵌运行时）
+#   scripts/build_app.sh --release     # 发版轨：arm64 自包含 + DMG + 签名策略
+#                                       # （检测到 Developer ID 证书则签名+公证+staple，
+#                                       #   否则 ad-hoc，用户按 README 四步放行）
 #
 # 产物：build/token-usage-dash.app（+ 可选 build/token-usage-dash.dmg）
 # 自编译产物不带 quarantine 属性，双击即开，Gatekeeper 不介入。
@@ -17,11 +20,12 @@ VERSION="0.1.0"
 BUILD_DIR="$REPO/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 
-UNIVERSAL=0; DMG=0
+UNIVERSAL=0; DMG=0; RELEASE=0
 for arg in "$@"; do
   case "$arg" in
     --universal) UNIVERSAL=1 ;;
     --dmg) DMG=1 ;;
+    --release) RELEASE=1; DMG=1; UNIVERSAL=0 ;;
     *) echo "未知参数: $arg" >&2; exit 1 ;;
   esac
 done
@@ -115,7 +119,29 @@ if [[ "$DMG" == 1 ]]; then
   DMG="$BUILD_DIR/$APP_NAME.dmg"
   rm -f "$DMG"
   hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+  if [[ "$RELEASE" == 1 ]]; then
+    # 发版签名策略：有 Developer ID 则真签名 + 公证（需已配置 notarytool 凭据），
+    # 无则保持 ad-hoc（Release 用户走 Sequoia 后四步放行，见 README）。
+    # grep 无匹配 exit 1，pipefail 会让整个替换非零、set -e 误杀脚本——|| true 兜底
+    IDENT="$(security find-identity -v -p codesigning 2>/dev/null \
+             | grep -oE '"Developer ID Application: [^"]+"' | head -1 | tr -d '"' || true)"
+    if [[ -n "$IDENT" ]]; then
+      echo "→ Developer ID 签名: $IDENT"
+      codesign --force --sign "$IDENT" --options runtime --timestamp "$APP"
+      codesign --verify --deep --strict "$APP"
+      echo "→ 公证 DMG（notarytool --wait，可能需数分钟）..."
+      if xcrun notarytool submit "$DMG" --wait; then
+        xcrun stapler staple "$DMG"
+        echo "✓ 已公证并 staple"
+      else
+        echo "⚠️ 公证失败——DMG 仍为 ad-hoc 观感，发布前处理" >&2; exit 1
+      fi
+    else
+      echo "ℹ️ 未检测到 Developer ID 证书：保持 ad-hoc（Release 用户按 README 四步放行）"
+    fi
+  fi
   echo "✓ $DMG  （浏览器下载会带 quarantine：需拖入 /Applications 后按 README 流程放行）"
+  shasum -a 256 "$DMG" | tee "$BUILD_DIR/$APP_NAME.dmg.sha256"
 fi
 if [[ "$UNIVERSAL" == 1 ]]; then
   echo "ℹ️ universal 版不含内嵌 Python，运行依赖系统 python3（见 README）"

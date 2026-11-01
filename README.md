@@ -46,20 +46,17 @@ Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成�
 
 ## 构建与运行
 
-### 方式一：本地编译 .app（零摩擦，推荐）
-
-自编译产物不带 quarantine 隔离属性，双击即开，Gatekeeper 完全不介入：
+### 方式一：一行命令安装（免编译，零摩擦）
 
 ```bash
-scripts/build_app.sh               # 本机架构 → build/token-usage-dash.app
-scripts/build_app.sh --universal   # Apple Silicon + Intel 通用二进制
-scripts/build_app.sh --dmg         # 追加打包 DMG（分发用）
+curl -fsSL https://raw.githubusercontent.com/Cuizy949/token-usage-dash/main/scripts/install.sh | bash
 ```
 
-打开 `build/token-usage-dash.app` 即可（常驻菜单栏 + 桌面悬浮卡）。
-要求 Xcode CommandLineTools（`xcrun swiftc`）与 Python 3.10+。
+下载最新 Release DMG、校验 SHA256、安装到 `/Applications/token-usage-dash.app`
+（旧实例自动退出，可重复执行升级）。curl 下载不打 quarantine 属性，
+装完 `open /Applications/token-usage-dash.app` 直接启动，Gatekeeper 不介入。
 
-### 方式二：Release DMG（免编译，首次需放行）
+### 方式二：Release DMG 手动安装（首次需放行）
 
 浏览器下载的 app 带 quarantine 属性，macOS 14+ 无开发者签名时首次打开流程：
 
@@ -75,7 +72,27 @@ Translocation（随机只读路径），launchd/菜单等功能可能异常。
 `~/.claude` 下 OAuth 凭据需要）——点「始终允许」即可。这是本地凭据读取，
 app 不出网发送任何凭据（额度探针仅以该凭据请求 Anthropic 官方接口）。
 
-### 方式三：裸跑采集链（不装 APP，纯 CLI）
+### 方式三：本地编译 .app
+
+```bash
+scripts/build_app.sh               # 本机架构（内嵌 Python 运行时，自包含）
+scripts/build_app.sh --universal   # Apple Silicon + Intel（走系统 python3）
+scripts/build_app.sh --dmg         # 追加打包 DMG
+scripts/build_app.sh --release     # 发版轨：+DMG+sha256（有 Developer ID 则签名+公证）
+```
+
+自编译产物同样不带 quarantine，双击即开。要求 Xcode CommandLineTools
+（`xcrun swiftc`；首次构建自动下载内嵌 Python 运行时，约 25MB）。
+
+### 常驻与配置（app 用户）
+
+- **开机自启**：菜单栏图标 → 设置… → 通用 → 登录时自动启动（SMAppService 登录项）
+- **可选功能**：设置窗口「推送与归档」（小屏推送/NAS 月归档）与「高级」
+  （Codex 路径/audit 根/Hermes 目录等）——与 CLI 环境变量同名同义（见下表），
+  留空即默认；GUI 配置优先于 shell 环境变量
+- launchd plist（`launchd/`）仅供裸 CLI 常驻参考，app 用户无需
+
+### 方式四：裸跑采集链（不装 APP，纯 CLI）
 
 ```bash
 python3 dash/ai_usage_fetch.py             # 全量六工具 + 三家额度 → JSON
