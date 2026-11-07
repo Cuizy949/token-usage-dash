@@ -1,17 +1,53 @@
-# token-usage-dash
+<h1 align="left">token-usage-dash</h1>
 
-An always-on-top desktop dashboard for AI coding agents' token usage —
-local-first, offline, zero cloud. Native-macOS-widget look.
+![token-usage-dash](assets/hero.png)
 
-| 桌面悬浮卡 | 设置窗口 |
-|---|---|
-| ![悬浮卡](assets/screenshot-card.png) | ![设置](assets/screenshot-settings.png) |
+[![macOS 14+ arm64](https://img.shields.io/badge/macOS-14%2B%20arm64-0DB3E5?logo=apple&logoColor=white)](#环境要求)
+[![Release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2FCuizy949%2Ftoken-usage-dash%2Freleases%2Flatest&query=%24.tag_name&label=release&color=8A63F4)](../../releases/latest)
+[![Swift](https://img.shields.io/badge/Swift-single--file%20NSPanel-F05138?logo=swift&logoColor=white)](#构建与运行)
+[![Python](https://img.shields.io/badge/Python-3.12%20embedded-3776AB?logo=python&logoColor=white)](#环境要求)
+[![License: MIT](https://img.shields.io/badge/License-MIT-97CA00)](LICENSE)
+[![Zero cloud](https://img.shields.io/badge/cloud-none%20%2F%20100%25%20local-success)](#设计要点)
+
+**English** · [中文](#中文)
+
+An always-on-top desktop dashboard for AI coding agents' token usage — local-first, offline, zero cloud. Native macOS-widget look (Liquid Glass on macOS 26).
+
+One single-file Swift panel + a Python collection layer track daily token spend, model mix, and 5h / weekly quota headroom across **six agents**: Codex · Claude Code · Hermes Agent · Trae · ZCode · WorkBuddy. All sources are local logs/SQLite read **read-only**; nothing leaves your Mac. Optional extras: push a rendered card image to a LAN small-screen device, and emit stdout reports (text/JSON) from a daily-report CLI for agents & cron.
+
+**Highlights**
+
+- 🎛️ **One card, six agents** — per-tool token totals, model names, quota bars, event-driven refresh
+- 🔒 **100% local & read-only** — parses local logs/SQLite; the only outbound calls are the quota probes you configure
+- 🪟 **Native look** — borderless NSPanel, classic & Liquid Glass modes, launch-at-login
+- 📦 **Zero-dependency app** — embedded Python 3.12 runtime + pycryptodome bundled in the DMG
+- 🤖 **Agent-friendly** — CLI & `--json` reports, a monthly SQLite stats store, monthly reconciliation against log ground truth
+
+### 快速开始 / Quick start
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cuizy949/token-usage-dash/main/scripts/install.sh | bash
+```
+
+Downloads the latest Release DMG, verifies SHA256, installs to `/Applications/token-usage-dash.app`. 自编译、Gatekeeper 放行、裸 CLI 等其它路径见下文。
+
+---
+
+<a id="中文"></a>
+## 中文说明
 
 macOS 桌面悬浮 AI Token 用量仪表盘：单文件 Swift（NSPanel 无边框置顶，支持
 macOS 26 液态玻璃）+ Python 采集层，统计 Codex / Claude Code / Hermes Agent /
 Trae / ZCode / WorkBuddy 六个 AI 工具的每日 token 消耗、模型构成与额度余量，
 可选推送渲染图到局域网小屏设备、经日报 CLI 输出 stdout 报告（文本/JSON，
 供 agent 调用）。离线单机：不接任何 gateway/IM，零云依赖。
+
+### 界面预览
+
+| 桌面悬浮卡（六工具 + 今日合计 + 额度余量条） | 设置窗口（自启 / 刷新频率 / 依赖自检） |
+|---|---|
+| ![悬浮卡](assets/screenshot-card.png) | ![设置](assets/screenshot-settings.png) |
+| 常驻置顶的无边框卡片：每工具日消耗、主力模型、5h/周额度进度条与重置时间 | GUI 配置优先于环境变量；自动检测 pycryptodome / zstd 依赖 |
 
 ```
 ┌─ dash/AiUsageDash.swift ── 悬浮卡 UI（经典/玻璃双模式、菜单、事件驱动刷新）
